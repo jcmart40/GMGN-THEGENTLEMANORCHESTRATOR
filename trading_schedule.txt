@@ -1,0 +1,33 @@
+*** ENABLED as of 2026-09-08 (TIME_PAUSE_ENABLED=true in .env)
+*** Built from 1,382 real trades across 3 sessions spanning nearly a full
+*** 24-hour cycle -- see SCHEDULE.md for the full table, win rates, and the
+*** outlier caveat (two "great" hours turned out to be single-trade
+*** illusions once checked, so they're NOT paused/favored either way).
+
+Local Time (Mountain)          Status
+
+--------------------------------------------
+12:00 AM -> 4:00 AM             trading
+4:00 AM  -> 6:00 AM             PAUSED  (31.6% / 23.6% win rate -- lowest
+                                          win rate of any hour, both halves)
+6:00 AM  -> 8:00 AM             trading
+8:00 AM  -> 9:00 AM             PAUSED  (worst single hour, -0.242 SOL)
+9:00 AM  -> 12:00 PM            trading
+12:00 PM -> 1:00 PM             PAUSED  (-0.118 SOL)
+1:00 PM  -> 2:00 PM             trading
+2:00 PM  -> 3:00 PM             PAUSED  (24.0% win rate)
+3:00 PM  -> 9:00 PM             trading
+9:00 PM  -> 10:00 PM            PAUSED  (largest sample of any hour -- 177
+                                          trades -- most statistically
+                                          reliable bad hour we have)
+10:00 PM -> 12:00 AM            trading (cycle repeats)
+
+Rule used to decide pause vs. trade: an hour is paused only once it shows
+BOTH a real net loss AND a depressed win rate, with a reasonable sample
+size behind it -- not just whichever hour happened to be red on one night.
+Two hours that LOOKED great (02:00-03:00 AM, +2.24 SOL; 11:00 PM-12:00 AM,
++1.50 SOL) were deliberately left untouched/not favored: each one's entire
+gain came from a single trade, and without it both were flat (~+0.04 SOL).
+22:00-23:00 (10-11 PM) is the one hour that's genuinely, broadly good even
+with its best trade removed -- notably the hour immediately AFTER the
+9-10 PM pause window, a real sharp swing hour-to-hour, not a smeared trend.
