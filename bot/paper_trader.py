@@ -20,6 +20,9 @@ import bot.file_lock as file_lock
 import bot.gmgn_client as gmgn
 import bot.trade_history as trade_history
 from config import config
+# ai_review imported lazily inside the notify call to avoid any import-order
+# sensitivity at module load; sets up no cycle (ai_review depends only on
+# trade_history/file_lock/config).
 
 log = logging.getLogger("gmgn-agent")
 
@@ -328,6 +331,8 @@ def simulate_sell(address: str, reason: str = "manual", known_price: float | Non
     log.info("PAPER SELL: %s (%s) @ %.10f, pnl=%.5f SOL (%.2f%%), reason=%s",
               closed["symbol"], address, exit_price, pnl_sol, pnl_pct * 100, reason)
     trade_history.record_trade({**closed, "mode": "paper"})
+    from bot import ai_review as _ai_review
+    _ai_review.notify_trade_outcome({**closed, "mode": "paper"})
     return closed
 
 

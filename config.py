@@ -945,6 +945,13 @@ class Config:
     # for the real mechanism this powers.
     xai_api_key: str = field(default_factory=lambda: os.getenv("XAI_API_KEY", ""))
     ai_review_every_n_trades: int = field(default_factory=lambda: _get_int("AI_REVIEW_EVERY_N_TRADES", 5))
+    # Notable-outcome threshold (2026-10-16): a closed trade whose |pnl_pct|
+    # exceeds this is flagged as a "notable outcome" and advances the AI Free
+    # Will review early -- so the Gentleman reacts to a single big win or
+    # big loss immediately instead of waiting for N accumulated trades.
+    # Absolute pct (e.g. 15 = +/-15%); 0 disables this early-trigger.
+    ai_review_notable_pnl_pct: float = field(
+        default_factory=lambda: _get_float("AI_REVIEW_NOTABLE_PNL_PCT", 15.0))
     ai_memory_file: str = field(default_factory=lambda: os.getenv("AI_MEMORY_FILE", "logs/ai_memory.json"))
     gentleman_chat_log_file: str = field(
         default_factory=lambda: os.getenv("GENTLEMAN_CHAT_LOG_FILE", "logs/gentleman_chat.jsonl"))

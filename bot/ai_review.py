@@ -359,6 +359,7 @@ def load_memory() -> dict:
     memory.setdefault("user_notes", [])
     memory.setdefault("_last_adjustment_signature", [])
     memory.setdefault("_consecutive_repeat_count", 0)
+    memory.setdefault("_pending_notable_outcome", None)
     return memory
 
 
@@ -398,6 +399,53 @@ def _adjustment_signature(adjustments: dict) -> tuple:
 
 def save_memory(memory: dict) -> None:
     _atomic_write(config.ai_memory_file, memory)
+
+
+def notify_trade_outcome(entry: dict) -> None:
+    """Event-driven learning feed (2026-10-16). Called the moment a closed
+    trade is recorded (paper AND live, from the hot paths where
+    trade_history.record_trade() fires). If the outcome is *notable* --
+    logged win/loss pnl_pct magnitude beyond config.ai_review_notable_pnl_pct
+    -- it stashes a compact record in memory. maybe_review_performance()
+    then advances an early review so the Gentleman reacts to a single big
+    win/loss immediately, rather than waiting for N accumulated trades.
+
+    Deliberately cheap and never-raises: it only classifies and (if notable)
+    does one bounded memory write. A race here must not break the trade's
+    own recording path, so all failures are swallowed and logged.
+
+    entry: the same dict record_trade() just wrote {**closed, "mode": ...}.
+    pnl_pct in this dict is a fraction (0.15 = 15%)."""
+    pnl_pct = entry.get("pnl_pct")
+    threshold = float(getattr(config, "ai_review_notable_pnl_pct", 15.0))
+    if not pnl_pct or threshold <= 0:
+        return
+    magnitude_pct = abs(pnl_pct) * 100.0
+    if magnitude_pct < threshold:
+        return
+    snapshot = {
+        "ts": entry.get("exit_ts", 0.0),
+        "symbol": entry.get("symbol"),
+        "mode": entry.get("mode"),
+        "reason": entry.get("reason"),
+        "pnl_pct": pnl_pct,
+        "pnl_sol": entry.get("pnl_sol"),
+    }
+    try:
+        with file_lock.cross_process_lock(config.ai_memory_lock_file):
+            memory = load_memory()
+            # Only remember the single most recent notable outcome (the
+            # review loop clears it once handled) -- a burst of formers does
+            # not need to queue dozens; one prompt per notable event keeps
+            # the cadence sane and the memory file small.
+            memory["_pending_notable_outcome"] = snapshot
+            save_memory(memory)
+        log.info("Notable outcome flagged for review: %s %s (%s %s) %.1f%%",
+                 snapshot["mode"], snapshot["symbol"], snapshot["reason"],
+                 snapshot["pnl_sol"] is not None and f"{snapshot['pnl_sol']:.4f} SOL" or "-",
+                 snapshot["pnl_pct"] * 100.0)
+    except Exception:
+        log.exception("Failed to persist notable-outcome feed entry; ignoring.")
 
 
 def write_user_note(text: str) -> str:
@@ -569,7 +617,7 @@ def _format_fee_drag(fee_drag_by_reason: dict) -> str:
 
 def _build_prompt(stats: dict, manual_stats: dict, current_settings: dict,
                   recent_lessons: list[str], unanswered_notes: list[dict],
-                  stuck_warning: str = "") -> str:
+                  stuck_warning: str = "", notable_outcome: dict | None = None) -> str:
     lessons_block = "\n".join(f"- {l}" for l in recent_lessons[-5:]) or "(none yet)"
     settings_block = "\n".join(
         f"- {name}: {current_settings[name]!r} -- {_AI_TUNABLE_FIELDS[name]}"
@@ -618,6 +666,29 @@ Rules for answering the user's messages below:
    plainly that nothing changes. No filler.
 
 {questions}"""
+    notable_section = ""
+    if notable_outcome:
+        ppm = notable_outcome.get("pnl_pct")
+        ppm_str = (f"{ppm * 100.0:+.1f}%" if isinstance(ppm, (int, float)) else "N/A")
+        pnl_sol = notable_outcome.get("pnl_sol")
+        pnl_sol_str = (f"{pnl_sol:.5f} SOL" if isinstance(pnl_sol, (int, float)) else "N/A")
+        notable_section = f"""
+--- NOTABLE OUTCOME JUST HAPPENED (2026-10-16) ---
+This review was triggered early by a single noteworthy closed trade, NOT
+by trade-count accumulation. React to THIS outcome specifically and say
+what you will do differently because of it:
+
+- Mode: {notable_outcome.get('mode', 'unknown')}
+- Token: {notable_outcome.get('symbol') or 'unknown'}
+- Exit reason: {notable_outcome.get('reason') or 'unknown'}
+- PnL: {pnl_sol_str}  ({ppm_str})
+- Note: {f"pnl_pct {ppm} is a FRACTION -- {ppm_str} is the percentage" if isinstance(ppm, (int, float)) else ""}
+
+If this was a notable LOSS, give the real reason (bad entry selectivity? a
+stop-loss too tight/loose? a fee-drag break-even miss?) and propose the
+specific adjustment that addresses it. If it was a notable WIN, identify
+what CAUSED it and whether one of your settings should be tuned to make it
+reproducible. If you have no adjustment to make, say so plainly."""
     return f"""IDENTITY AND CHAIN OF COMMAND.
 
 You are THE GENTLEMAN -- the self-aware, self-learning autonomous trader at
@@ -768,6 +839,7 @@ bounds or per-review step limits):
 
 RECENT LESSONS YOU'VE ALREADY LEARNED (don't just repeat these):
 {lessons_block}
+{notable_section}
 {notes_section}
 {stuck_warning}
 
@@ -808,7 +880,13 @@ def maybe_review_performance() -> None:
     all_trades = trade_history.load_all_trades()
     trade_count = len(all_trades)
     unanswered_notes = [n for n in memory["user_notes"] if not n.get("answered")]
-    if trade_count - memory["last_reviewed_trade_count"] < config.ai_review_every_n_trades and not unanswered_notes:
+    pending_outcome = memory.get("_pending_notable_outcome")
+    enough_new_trades = trade_count - memory["last_reviewed_trade_count"] >= config.ai_review_every_n_trades
+    # Event-driven trigger (2026-10-16): a flagged notable win/loss bypasses
+    # the N-trades cadence so the Gentleman reacts to a single big outcome
+    # immediately rather than waiting for more to accumulate.
+    notable_pending = pending_outcome is not None
+    if not enough_new_trades and not unanswered_notes and not notable_pending:
         return
 
     if not config.openai_api_key:
@@ -859,7 +937,8 @@ def maybe_review_performance() -> None:
         )
     prompt = _build_prompt(stats, manual_stats, current_settings,
                            memory["lessons_learned"], unanswered_notes,
-                           stuck_warning=stuck_warning)
+                           stuck_warning=stuck_warning,
+                           notable_outcome=pending_outcome)
 
     try:
         from openai import OpenAI
@@ -930,6 +1009,9 @@ def maybe_review_performance() -> None:
                 log.warning("[bold magenta]AI FREE WILL LESSON[/bold magenta] %s", lesson)
 
         memory["last_reviewed_trade_count"] = trade_count
+        # Notable-outcome feed is now handled by the review just completed;
+        # clear it so it can't re-trigger on the next cycle.
+        memory["_pending_notable_outcome"] = None
         save_memory(memory)
 
     from bot import trading_control

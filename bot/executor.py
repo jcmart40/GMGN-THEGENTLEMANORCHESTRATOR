@@ -453,6 +453,7 @@ def execute_sell(address: str, reason: str = "manual") -> dict:
             "restoring it again.", closed["symbol"], address, age_secs,
         )
         trade_history.record_trade({**closed, "mode": "live"})
+        ai_review.notify_trade_outcome({**closed, "mode": "live"})
         raise ExecutionBlocked(
             f"{address} no longer held after {age_secs:.0f}s -- treated as closed externally, "
             f"removed from tracking for good (see logs)"
@@ -512,4 +513,5 @@ def execute_sell(address: str, reason: str = "manual") -> dict:
                 closed["symbol"], address, reason,
                 f"{pnl_sol:.5f} SOL ({pnl_pct * 100:.2f}%)" if pnl_sol is not None else "unknown", result)
     trade_history.record_trade({**closed, "mode": "live"})
+    ai_review.notify_trade_outcome({**closed, "mode": "live"})
     return closed
