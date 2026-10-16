@@ -1,5 +1,34 @@
 # GMGN-bot — handoff (2026-09-06, fully autonomous rebuild)
 
+## 2026-10-15 — TOMORROW: The Gentleman is STUCK (rate-limit spin loop) + flicker
+
+**State: the bot process is effectively hung and needs a clean restart before
+any new work. Paper mode, dash is clean, no real money at risk.**
+
+1. HE IS STUCK. Do NOT debug as-is — restart his screener engine.
+   - Last activity 19:08:33 (10/15); 45+ min of zero writes since.
+   - Process alive but CPU-spinning (~943s CPU in 51 min): stuck in a tight
+     GMGN rate-limit retry loop that is NOT respecting the backoff sleep.
+   - Trigger: GMGN rate-limited hard ~19:06, candidates rejected
+     "rate-limited (fail-closed)". Normal backoff (RATE_LIMIT_MAX_CONSECUTIVE
+     =3 / COOLDOWN=45 / BASE=5s) should sleep it out; it spun instead.
+   - FIX: kill the stuck screener PIDs and launch fresh `python -m bot.screener`.
+   - Follow-up worth investigating: why the backoff loop spun instead of
+     sleeping — check screener.py's rate-limit catch path (did a bare `except`
+     or a non-sleep retry swallow the 429 backoff?).
+
+2. FLICKER CAME BACK. The running dashboard (started 10/15 19:02) predates
+   commit 98552a8, the screen=False flicker fix. Restart the dashboard with a
+   SINGLE fresh `python tui.py`; do not keep two tui.py processes (a parent
+   forks a child — kill the whole tree and start ONE).
+
+**Commands for tomorrow (after killing the stuck processes):**
+   - `python -m bot.screener`  (engine; runs screener + exit_manager + AI review)
+   - `python tui.py`           (ONE dashboard window only)
+
+**Also see earlier ready-state notes, and note `GMGN_ALLOW_AUTOMATED_TRADES=1`
++ TRADING_MODE=paper + OPENAI_API_KEY set are all active from this session.**
+
 ## Operator dashboard-reset instruction (2026-10-13)
 
 When the operator says "clear the dash" or asks to clear all trading data for
