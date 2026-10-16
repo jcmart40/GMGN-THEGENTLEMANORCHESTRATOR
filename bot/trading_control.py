@@ -12,6 +12,7 @@ import os
 import tempfile
 import time
 
+import bot.ai_review as ai_review
 import bot.file_lock as file_lock
 import bot.trade_history as trade_history
 from config import config, hour_in_windows
@@ -58,8 +59,7 @@ def get_mode() -> str:
 def set_mode(mode: str, note: str | None = None) -> dict:
     if mode not in _SETTABLE_MODES:
         raise InvalidMode(
-            f"Cannot set trading mode to {mode!r} -- must be one of {_SETTABLE_MODES}. "
-            f"'live' execution isn't built yet (see config.py's default_trading_mode docstring)."
+            f"Cannot set trading mode to {mode!r} -- must be one of {_SETTABLE_MODES}."
         )
     state = {"mode": mode, "updated_ts": time.time(), "note": note}
     directory = os.path.dirname(config.trading_control_file) or "."
@@ -72,7 +72,7 @@ def set_mode(mode: str, note: str | None = None) -> dict:
 
 
 def is_live_session_paused() -> bool:
-    """True once config.max_live_trades_per_session live trades have
+    """True once the effective max_live_trades_per_session live trades have
     closed since mode was last switched to live -- checked by
     bot/screener.py's _autonomous_buy() to block NEW live buys.
 
@@ -91,13 +91,15 @@ def is_live_session_paused() -> bool:
     user's explicit request -- guard added since this function previously
     had no disable path: count >= 0 would have paused immediately after
     the very first trade, the opposite of "off")."""
-    if config.max_live_trades_per_session <= 0:
+    max_live_trades_per_session = ai_review.get_effective_value(
+        "max_live_trades_per_session")
+    if max_live_trades_per_session <= 0:
         return False
     state = get_state()
     if state["mode"] != "live":
         return False
     count = trade_history.count_live_trades_since(state["updated_ts"])
-    return count >= config.max_live_trades_per_session
+    return count >= max_live_trades_per_session
 
 
 def maybe_log_live_session_pause() -> None:
@@ -181,22 +183,24 @@ def record_trade_for_burst() -> None:
     trade_burst_state_lock_file docstring) -- same read-modify-write race
     class every other shared state file in this project already guards
     against."""
-    if config.trade_burst_limit <= 0:
+    trade_burst_limit = ai_review.get_effective_value("trade_burst_limit")
+    trade_burst_cooldown_secs = ai_review.get_effective_value("trade_burst_cooldown_secs")
+    if trade_burst_limit <= 0:
         return
     with file_lock.cross_process_lock(config.trade_burst_state_lock_file):
         state = _load_burst_state()
         state["count"] = state.get("count", 0) + 1
-        if state["count"] >= config.trade_burst_limit:
-            state["paused_until"] = time.time() + config.trade_burst_cooldown_secs
+        if state["count"] >= trade_burst_limit:
+            state["paused_until"] = time.time() + trade_burst_cooldown_secs
             state["count"] = 0
             log.warning("[bold yellow]TRADE BURST COOLDOWN[/bold yellow] %d trades in a row -- "
                         "pausing new buys for %.0fs. Exit management keeps running normally on "
-                        "whatever's already open.", config.trade_burst_limit, config.trade_burst_cooldown_secs)
+                        "whatever's already open.", trade_burst_limit, trade_burst_cooldown_secs)
         _save_burst_state(state)
 
 
 def is_burst_paused() -> bool:
-    if config.trade_burst_limit <= 0:
+    if ai_review.get_effective_value("trade_burst_limit") <= 0:
         return False
     return time.time() < _load_burst_state().get("paused_until", 0.0)
 
@@ -224,15 +228,17 @@ def record_trade_time(now: float | None = None) -> None:
 
 
 def is_min_interval_active() -> bool:
-    if config.min_time_between_trades_secs <= 0:
+    min_time_between_trades_secs = ai_review.get_effective_value("min_time_between_trades_secs")
+    if min_time_between_trades_secs <= 0:
         return False
     last = _load_burst_state().get("last_trade_ts", 0.0)
-    return (time.time() - last) < config.min_time_between_trades_secs
+    return (time.time() - last) < min_time_between_trades_secs
 
 
 def min_interval_remaining() -> float:
+    min_time_between_trades_secs = ai_review.get_effective_value("min_time_between_trades_secs")
     last = _load_burst_state().get("last_trade_ts", 0.0)
-    return max(0.0, config.min_time_between_trades_secs - (time.time() - last))
+    return max(0.0, min_time_between_trades_secs - (time.time() - last))
 
 
 # -- Time-of-day pause (2026-09-08) -- see config.py's time_pause_enabled/
@@ -242,9 +248,9 @@ def min_interval_remaining() -> float:
 # gets "triggered" and needs to auto-clear later.
 
 def is_time_paused(now: float | None = None) -> bool:
-    if not config.time_pause_enabled:
+    if not ai_review.get_effective_value("time_pause_enabled"):
         return False
     from datetime import datetime, timezone
     dt = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
     hour = dt.hour + dt.minute / 60.0
-    return hour_in_windows(hour, config.time_pause_windows_utc)
+    return hour_in_windows(hour, ai_review.get_effective_value("time_pause_windows_utc"))

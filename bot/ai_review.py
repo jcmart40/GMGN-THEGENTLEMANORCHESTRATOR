@@ -1,7 +1,8 @@
 """AI Free Will / self-learning review loop -- periodically reviews recent
-closed trades (bot/trade_history.py) via OpenAI and may adjust
-stop_loss_pct/take_profit_pct within bounded steps, writing a lesson to a
-memory file. Mirrors Axiom-bot's own bot/performance_evaluator.py. Built
+closed trades (bot/trade_history.py) via OpenAI and may adjust allowlisted
+strategy settings without bounds or per-review step limits while in paper
+mode, writing lessons to a memory file. Mirrors Axiom-bot's own
+bot/performance_evaluator.py. Built
 2026-09-06, user's own explicit request: "he needs to be fully aware and
 self-learning with free will."
 
@@ -12,21 +13,20 @@ config.py's own static fields (those are only read once at process start)
 -- same reasoning Axiom-bot's own settings_override.json pattern uses:
 a change takes effect immediately, no restart needed.
 
-Deliberately a SMALLER first version than Axiom's own review loop, which
-only reached its current dedup/grounding-gate/user-note sophistication
-after months of live iteration (see that module's own history). This
-version has the core loop -- real OpenAI call, bounded adjustment, lesson
-memory -- without those later hardening layers. A natural next step once
-this has run for a while and produces evidence of drift/repetition, same
-as how Axiom's own gates got added.
+The AI response is limited by a type-checked strategy allowlist. It cannot
+change trade size, exposure caps, wallet settings, execution settings, or
+trading mode. This is an application-level boundary for the built-in
+reviewer, not a sandbox for an external coding agent.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
 import time
+import uuid
 from datetime import datetime, timezone
 
 import bot.file_lock as file_lock
@@ -35,105 +35,47 @@ from config import config
 
 log = logging.getLogger("gmgn-agent")
 
-# Same two fields exit_manager.py actually enforces. Bounds are a starting
-# guess, not backtested -- same caveat as the base stop_loss_pct/
-# take_profit_pct defaults in config.py.
-_AI_FIELD_BOUNDS = {
-    "stop_loss_pct": (5.0, 30.0),
-    "take_profit_pct": (10.0, 200.0),
-    "profit_giveback_pct": (5.0, 40.0),
-    "queue_pressure_min_profit_pct": (5.0, 100.0),
-    "stale_position_max_age_secs": (30.0, 1800.0),
-    # Entry-selectivity fields (2026-09-08, user's explicit request: "screw
-    # the selective builded so he can tune it himself" -- previously these
-    # were fixed in .env with no AI-tunable path at all, which meant every
-    # "I'll be more/less selective" answer the AI gave was just words with
-    # no mechanism behind it (confirmed directly, real gap found live).
-    # bot/security.py now reads all five via this same get_effective_*()
-    # pattern the exit fields already use. Bounds keep real screening
-    # intact at both ends -- 0/unlimited would mean no screening at all,
-    # which is a different, much bigger decision than "be more moderate."
-    "max_rug_ratio": (0.15, 0.5),
-    "max_top_10_holder_rate": (0.15, 0.5),
-    "max_bundler_rate": (0.15, 0.5),
-    "max_rat_trader_rate": (0.1, 0.4),
-    # Inverted vs the four above -- LOWER min_liquidity_usd is the LOOSER/
-    # more-permissive direction (accepts thinner-liquidity tokens), higher
-    # is tighter/more selective. Flagged explicitly in the prompt too so
-    # the model doesn't reason about it backwards relative to the others.
-    # Upper bound raised 8000 -> 12000 (2026-09-17, real evidence of
-    # stop-loss drag in choppy conditions), then the WHOLE range narrowed
-    # to (8000, 12000) same day after 12000 as the live value choked the
-    # pipeline to zero buys (200/200 rejected, 87% on liquidity alone --
-    # confirmed live, and by the AI's own answer to a direct question: "The
-    # 2000 [sic, meant 12000] floor appears to be too strict ... filters
-    # out nearly all freshly-deployed tokens"). Live value split the
-    # difference to 10000. Lower bound raised 1000 -> 8000 too, not just
-    # the upper one -- the whole point of this field going forward is
-    # giving the AI room to self-correct between "too loose" (8000, where
-    # it started causing the original stop-loss drag) and "too tight"
-    # (12000, where it just proved it chokes the pipeline dry), not the
-    # AI's full historical 1000-8000 range from before this incident.
-    # Widened again same day (still 2026-09-17): testing a genuinely
-    # different, more permissive approach at 3000 -- below the original
-    # 8000 floor -- while tuning is manually paused. Lower bound dropped
-    # to 3000 so this stays valid once tuning resumes rather than getting
-    # silently clamped back up to 8000 the moment the AI next touches it.
-    "min_liquidity_usd": (3000.0, 12000.0),
-    # Flat-coin grace period (2026-09-10, see config.py's own field
-    # comments for the full fee-drag finding this responds to). Two new
-    # fields, both additive -- neither restricts anything the AI could
-    # already do; they give it a genuinely new lever it didn't have before.
-    # flat_pnl_band_pct bounds: 0.5 (tight -- only near-dead-flat counts)
-    # to 10.0 (generous -- most small moves count as "flat").
-    "flat_pnl_band_pct": (0.5, 10.0),
-    # flat_position_extra_secs bounds: 0 (grace period effectively off,
-    # same as today) to 900.0 (up to 15 extra minutes for a flat position
-    # to develop) -- deliberately capped well below stale_position_max_age_
-    # secs's own 1800.0 ceiling so "extra time" can't alone reach the kind
-    # of multi-hour hold that was never the intent here.
-    "flat_position_extra_secs": (0.0, 900.0),
-    # Liquidity-exit floor (2026-09-14, real incident: 9 positions tonight
-    # each lost 96-99.8% of their value because they kept getting held for
-    # a bigger price target while the pool's own liquidity quietly drained
-    # to nothing underneath them -- by the time they finally sold, there
-    # was nothing left to sell into. Every existing exit rule (stop-loss,
-    # take-profit, stale, etc.) is purely PRICE-based; none of them looked
-    # at the pool's own liquidity at all, even though bot/exit_manager.py's
-    # _fetch_price() already reads it on every single check cycle (same
-    # get_token_info() call, no extra API cost). This is a genuinely new,
-    # independent signal: if a position's own liquidity drops below this
-    # many USD, close it immediately regardless of current PnL -- the
-    # point is getting out BEFORE the pool is dead, not waiting for a
-    # price target that may never be reachable once liquidity is gone.
-    #
-    # UNITS CORRECTED 2026-09-14: this field was initially built assuming
-    # get_token_info()'s "liquidity" field was SOL-denominated -- verified
-    # live against a real token (platform showed "Liq $4.02K", the raw API
-    # field returned 3919.82) that it's actually USD, same convention as
-    # config.min_liquidity_usd's own entry-screening check. Bounds/default
-    # below are real USD figures, not the original (wrong-scale) SOL guess.
-    # Tonight's dead/dying pools measured under $1 (as low as $0.04);
-    # entry screening itself requires $1000-$8000 minimum just to buy.
-    # $300 default sits comfortably above "already basically dead" with
-    # real margin, comfortably below the entry bar so it doesn't fire the
-    # instant a position is bought.
-    "min_exit_liquidity_usd": (100.0, 2000.0),
+# Explicit strategy/operations allowlist. Capital sizing, wallet details,
+# credentials, execution settings, mode, and fixed security checks are protected.
+_AI_TUNABLE_FIELDS = {
+    "stop_loss_pct": "Stop-loss threshold in percent; 0 or less disables it.",
+    "take_profit_pct": "Take-profit threshold in percent.",
+    "profit_giveback_pct": "Peak-to-current profit drop in percentage points.",
+    "queue_pressure_min_profit_pct": "Profit threshold for closing into a buy queue.",
+    "stale_position_max_age_secs": "Maximum age before a position is considered stale.",
+    "max_rug_ratio": "Maximum accepted rug ratio; higher is less selective.",
+    "min_liquidity_usd": "Minimum entry liquidity in USD; lower is less selective.",
+    "flat_pnl_band_pct": "PnL percentage-point band considered flat.",
+    "flat_position_extra_secs": "Extra time allowed for a flat position.",
+    "min_exit_liquidity_usd": "Liquidity floor in USD for an immediate exit.",
+    "min_market_cap_usd": "Minimum market cap in USD; 0 disables the minimum.",
+    "max_market_cap_usd": "Maximum market cap in USD; 0 disables the maximum.",
+    "min_liquidity_to_mcap_ratio": "Minimum pool-liquidity/market-cap ratio; 0 disables it.",
+    "liquidity_drain_mcap_threshold_usd": "Market cap in USD at which liquidity-drain exits arm; 0 disables.",
+    "liquidity_drain_pct": "Peak-liquidity drop percent that triggers a liquidity-drain exit; 0 disables.",
+    "losing_position_max_age_secs": "Maximum age for a non-profitable position.",
+    "stop_loss_confirm_secs": "Seconds a stop-loss breach must persist; 0 disables confirmation.",
+    "emergency_drawdown_pct": "Drawdown percent that bypasses stop-loss confirmation; 0 disables.",
+    "max_hold_secs": "Unconditional maximum position age; 0 disables it.",
+    "require_renounced_mint": "Whether mint authority must be renounced.",
+    "require_renounced_freeze": "Whether freeze authority must be renounced.",
+    "min_net_buy_24h_usd": "Minimum 24-hour net buy volume in USD; 0 disables the minimum.",
+    "min_buys_24h": "Minimum 24-hour buy count.",
+    "max_live_trades_per_session": "Maximum closed live trades per session; 0 disables the cap.",
+    "max_concurrent_positions": "Maximum open positions; lower values limit simultaneous exposure.",
+    "trade_burst_limit": "Successful buys per burst before cooldown; 0 disables.",
+    "trade_burst_cooldown_secs": "Cooldown duration after a trade burst.",
+    "min_time_between_trades_secs": "Minimum seconds between successful buys; 0 disables.",
+    "time_pause_enabled": "Whether the configured UTC time-of-day pause is active.",
+    "time_pause_windows_utc": "UTC hour intervals when new entries are paused.",
+    "queue_pressure_lookback_secs": "How long a skipped-position entry counts as queue pressure.",
+    "new_creation_max_age": "Maximum GMGN token age for the new-deployment feed (e.g. 30s or 5m); empty disables.",
+    "post_review_pause_secs": "New-buy pause after a completed AI review; 0 disables.",
 }
-_AI_FIELD_MAX_STEP = {
-    "stop_loss_pct": 5.0,
-    "take_profit_pct": 20.0,
-    "profit_giveback_pct": 10.0,
-    "queue_pressure_min_profit_pct": 15.0,
-    "stale_position_max_age_secs": 300.0,
-    "max_rug_ratio": 0.1,
-    "max_top_10_holder_rate": 0.1,
-    "max_bundler_rate": 0.1,
-    "max_rat_trader_rate": 0.08,
-    "min_liquidity_usd": 1500.0,
-    "flat_pnl_band_pct": 2.0,
-    "flat_position_extra_secs": 150.0,
-    "min_exit_liquidity_usd": 200.0,
+_AI_NUMERIC_FIELDS = {
+    name for name in _AI_TUNABLE_FIELDS
+    if isinstance(getattr(config, name), (int, float))
+    and not isinstance(getattr(config, name), bool)
 }
 
 
@@ -191,66 +133,119 @@ def _load_overrides() -> dict:
     return _overrides_cache["data"]
 
 
+def _normalize_ai_value(field: str, value):
+    if field not in _AI_TUNABLE_FIELDS:
+        raise ValueError(f"{field!r} is not an AI-tunable strategy field")
+
+    default = getattr(config, field)
+    if isinstance(default, bool):
+        if type(value) is not bool:
+            raise ValueError(f"{field} must be a boolean")
+        return value
+    if isinstance(default, int):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field} must be an integer")
+        return value
+    if isinstance(default, float):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{field} must be a number")
+        normalized = float(value)
+        if not math.isfinite(normalized):
+            raise ValueError(f"{field} must be finite")
+        return normalized
+    if isinstance(default, str):
+        if not isinstance(value, str):
+            raise ValueError(f"{field} must be a string")
+        return value
+    if isinstance(default, list) and field == "time_pause_windows_utc":
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{field} must be a list of [start_hour, end_hour] pairs")
+        windows = []
+        for window in value:
+            if not isinstance(window, (list, tuple)) or len(window) != 2:
+                raise ValueError(f"{field} entries must be [start_hour, end_hour] pairs")
+            start, end = window
+            if any(isinstance(hour, bool) or not isinstance(hour, (int, float))
+                   or not math.isfinite(hour) or not 0 <= hour < 24 for hour in (start, end)):
+                raise ValueError(f"{field} hours must be finite numbers in [0, 24)")
+            windows.append((float(start), float(end)))
+        return windows
+    raise ValueError(f"{field} has an unsupported AI-tunable type")
+
+
+def get_effective_value(field: str):
+    """Read an allowlisted strategy value, falling back on invalid overrides."""
+    if field not in _AI_TUNABLE_FIELDS:
+        raise ValueError(f"{field!r} is not an AI-tunable strategy field")
+    default = getattr(config, field)
+    value = _load_overrides().get(field, default)
+    try:
+        return _normalize_ai_value(field, value)
+    except ValueError:
+        log.error("Ignoring invalid AI override for %s: %r", field, value)
+        return default
+
+
 def get_effective_stop_loss_pct() -> float:
-    return _load_overrides().get("stop_loss_pct", config.stop_loss_pct)
+    return get_effective_value("stop_loss_pct")
 
 
 def get_effective_take_profit_pct() -> float:
-    return _load_overrides().get("take_profit_pct", config.take_profit_pct)
+    return get_effective_value("take_profit_pct")
 
 
 def get_effective_profit_giveback_pct() -> float:
-    return _load_overrides().get("profit_giveback_pct", config.profit_giveback_pct)
+    return get_effective_value("profit_giveback_pct")
 
 
 def get_effective_queue_pressure_min_profit_pct() -> float:
-    return _load_overrides().get("queue_pressure_min_profit_pct", config.queue_pressure_min_profit_pct)
+    return get_effective_value("queue_pressure_min_profit_pct")
 
 
 def get_effective_stale_position_max_age_secs() -> float:
-    return _load_overrides().get("stale_position_max_age_secs", config.stale_position_max_age_secs)
+    return get_effective_value("stale_position_max_age_secs")
 
 
 def get_effective_flat_pnl_band_pct() -> float:
-    return _load_overrides().get("flat_pnl_band_pct", config.flat_pnl_band_pct)
+    return get_effective_value("flat_pnl_band_pct")
 
 
 def get_effective_flat_position_extra_secs() -> float:
-    return _load_overrides().get("flat_position_extra_secs", config.flat_position_extra_secs)
+    return get_effective_value("flat_position_extra_secs")
 
 
 # -- Entry-selectivity accessors (2026-09-08) -- bot/security.py reads these
 # instead of the raw config.* fields, same pattern as every exit field above.
 
 def get_effective_max_rug_ratio() -> float:
-    return _load_overrides().get("max_rug_ratio", config.max_rug_ratio)
+    return get_effective_value("max_rug_ratio")
 
 
 def get_effective_max_top_10_holder_rate() -> float:
-    return _load_overrides().get("max_top_10_holder_rate", config.max_top_10_holder_rate)
+    return config.max_top_10_holder_rate
 
 
 def get_effective_max_bundler_rate() -> float:
-    return _load_overrides().get("max_bundler_rate", config.max_bundler_rate)
+    return config.max_bundler_rate
 
 
 def get_effective_max_rat_trader_rate() -> float:
-    return _load_overrides().get("max_rat_trader_rate", config.max_rat_trader_rate)
+    return config.max_rat_trader_rate
 
 
 def get_effective_min_liquidity_usd() -> float:
-    return _load_overrides().get("min_liquidity_usd", config.min_liquidity_usd)
+    return get_effective_value("min_liquidity_usd")
 
 
 def get_effective_min_exit_liquidity_usd() -> float:
-    return _load_overrides().get("min_exit_liquidity_usd", config.min_exit_liquidity_usd)
+    return get_effective_value("min_exit_liquidity_usd")
 
 
 # -- post-review pause (2026-09-06, user's explicit request: give the AI ---
 # "time to review his data and see where the mistakes were") -------------
 # Stored under a leading-underscore key in the SAME overrides file rather
 # than a new one -- it's directly tied to this module's own review cycle,
-# and the leading underscore keeps it out of _AI_FIELD_BOUNDS/the generic
+# and the leading underscore keeps it out of the strategy allowlist/generic
 # adjustment loop (those iterate specific known field names, never this
 # key). Screening/rejection and exit management (stop-loss/take-profit/
 # profit-giveback on ALREADY-open positions) are untouched by this pause --
@@ -258,6 +253,7 @@ def get_effective_min_exit_liquidity_usd() -> float:
 # open goes unmonitored while paused.
 
 def is_paused_for_review() -> bool:
+    pause_secs = get_effective_value("post_review_pause_secs")
     # post_review_pause_secs <= 0 disables this entirely (2026-09-08, user's
     # explicit request -- confirmed real data first: 33 of the last 40 buy
     # attempts were skipped for this exact reason, since 5 fast closes can
@@ -266,21 +262,22 @@ def is_paused_for_review() -> bool:
     # trading time). Guarded explicitly, not just left at 0 and trusted to
     # the comparison below, since time.time() + 0 is technically still a
     # valid (if near-instant) future timestamp, not a clean "disabled."
-    if config.post_review_pause_secs <= 0:
+    if pause_secs <= 0:
         return False
     until = _load_overrides().get("_review_pause_until", 0.0)
     return time.time() < until
 
 
 def _start_review_pause() -> None:
-    if config.post_review_pause_secs <= 0:
+    pause_secs = get_effective_value("post_review_pause_secs")
+    if pause_secs <= 0:
         return
     with file_lock.cross_process_lock(config.ai_overrides_lock_file):
         overrides = _load_overrides()
-        overrides["_review_pause_until"] = time.time() + config.post_review_pause_secs
+        overrides["_review_pause_until"] = time.time() + pause_secs
         _atomic_write(config.ai_overrides_file, overrides)
     log.warning("[bold magenta]AI FREE WILL[/bold magenta] pausing new buys for %.0fs to let this "
-                "review's adjustments take effect before more trades pile up.", config.post_review_pause_secs)
+                "review's adjustments take effect before more trades pile up.", pause_secs)
 
 
 # -- manual tuning pause (2026-09-17, user's explicit request: "tell him ---
@@ -306,30 +303,51 @@ def set_tuning_paused(paused: bool) -> None:
                 else "RESUMED")
 
 
-def _apply_adjustment(field: str, proposed: float) -> float | None:
-    """Clamp `proposed` into field's bounds and max-step-per-adjustment,
-    same two-guardrail shape Axiom's own auto_tuner.py uses. Returns the
-    actual applied value, or None if nothing changed (already at the
-    clamped value).
+def _apply_adjustment(field: str, proposed):
+    """Apply a type-checked allowlisted strategy value without clipping it.
+    Returns the applied value, or None if it is already effective.
 
     Cross-process lock (2026-09-09, see config.py's ai_overrides_lock_file
     docstring): Claude's own ad-hoc `python -c` interventions on this exact
     file happened repeatedly tonight, concurrently with this exact function
     potentially running in the live bot's own process."""
+    normalized = _normalize_ai_value(field, proposed)
     with file_lock.cross_process_lock(config.ai_overrides_lock_file):
-        lo, hi = _AI_FIELD_BOUNDS[field]
-        max_step = _AI_FIELD_MAX_STEP[field]
         overrides = _load_overrides()
-        current = overrides.get(field, getattr(config, field))
-
-        step = max(-max_step, min(max_step, proposed - current))
-        new_value = max(lo, min(hi, current + step))
-        if new_value == current:
+        current = get_effective_value(field)
+        if normalized == current:
             return None
 
-        overrides[field] = new_value
+        overrides[field] = normalized
         _atomic_write(config.ai_overrides_file, overrides)
-        return new_value
+        return normalized
+
+
+def _apply_review_adjustments(adjustments: dict, mode: str) -> bool:
+    if is_tuning_paused():
+        log.info("AI Free Will tuning is manually paused (operator request) -- review ran "
+                 "(lessons/notes recorded above), but skipping every proposed parameter "
+                 "adjustment this cycle.")
+        return False
+    if mode != "paper":
+        log.warning("AI Free Will recorded this review in mode %r, but tuning is paper-only; "
+                    "no strategy changes were applied.", mode)
+        return False
+
+    for field in adjustments.keys() - _AI_TUNABLE_FIELDS:
+        log.warning("AI proposed protected or unknown setting %r; ignoring it.", field)
+    for field in _AI_TUNABLE_FIELDS:
+        if field in adjustments:
+            try:
+                proposed = _normalize_ai_value(field, adjustments[field])
+                applied = _apply_adjustment(field, proposed)
+            except ValueError as exc:
+                log.warning("Ignoring invalid AI adjustment for %s: %s", field, exc)
+                continue
+            if applied is not None:
+                log.warning("[bold magenta]AI FREE WILL ADJUSTMENT[/bold magenta] %s -> %r",
+                            field, applied)
+    return True
 
 
 # -- memory (lessons learned) ------------------------------------------------
@@ -360,24 +378,21 @@ _MAX_CONSECUTIVE_REPEATS = 2  # same conclusion can be stated twice; the 3rd+ re
 
 
 def _adjustment_signature(adjustments: dict) -> tuple:
-    """(field, '+'/'-') pairs for every field this review proposed
-    adjusting, direction relative to its CURRENT effective value at call
-    time -- sorted so the signature doesn't depend on which order the
-    model listed fields in. Empty tuple if nothing was proposed (never
-    counts as a "repeat" of anything)."""
+    """Canonical field/direction pairs, sorted independently of response order."""
     sig = []
-    for field in _AI_FIELD_BOUNDS:
+    for field in _AI_TUNABLE_FIELDS:
         if field not in adjustments:
             continue
         try:
-            proposed = float(adjustments[field])
-        except (TypeError, ValueError):
+            proposed = _normalize_ai_value(field, adjustments[field])
+            current = get_effective_value(field)
+        except ValueError:
             continue
-        current = _load_overrides().get(field, getattr(config, field))
-        if proposed > current:
-            sig.append((field, "+"))
-        elif proposed < current:
-            sig.append((field, "-"))
+        if proposed != current:
+            if field in _AI_NUMERIC_FIELDS:
+                sig.append((field, "+" if proposed > current else "-"))
+            else:
+                sig.append((field, repr(proposed)))
     return tuple(sorted(sig))
 
 
@@ -385,7 +400,7 @@ def save_memory(memory: dict) -> None:
     _atomic_write(config.ai_memory_file, memory)
 
 
-def write_user_note(text: str) -> None:
+def write_user_note(text: str) -> str:
     """Records a question/directive FROM THE USER for the AI to answer on
     its next review -- mirrors Axiom-bot's own write_user_note() exactly
     (bot/performance_evaluator.py), built 2026-09-06 at the user's explicit
@@ -403,16 +418,21 @@ def write_user_note(text: str) -> None:
     docstring): this function runs as a separate ad-hoc `python -c`
     process every time Claude calls it, genuinely concurrent with
     bot.screener's own review loop -- a real, multi-second OpenAI call can
-    be in flight in that other process at the exact same moment."""
+    be in flight in that other process at the exact same moment. Returns
+    a unique note ID so a chat client can pair the eventual answer with
+    this exact message."""
+    note_id = uuid.uuid4().hex
     with file_lock.cross_process_lock(config.ai_memory_lock_file):
         memory = load_memory()
         memory["user_notes"].append({
+            "id": note_id,
             "ts": _timestamp_prefix().strip(" []"),
             "text": text,
             "answered": False,
             "answer": None,
         })
         save_memory(memory)
+    return note_id
 
 
 def _apply_user_note_answers(unanswered_notes: list, answers) -> int:
@@ -526,8 +546,8 @@ def _format_fee_drag(fee_drag_by_reason: dict) -> str:
     """Renders _gather_fee_drag_by_reason()'s output as plain lines the
     model can read directly, one per exit reason, each pre-labeled with
     what the gap means -- deliberately spelled out rather than left for
-    the model to infer, same reasoning as _bound_flag() below (an implicit
-    signal in the raw numbers wasn't enough on its own to change behavior,
+    the model to infer (an implicit signal in the raw numbers wasn't enough
+    on its own to change behavior,
     see that function's own docstring)."""
     if not fee_drag_by_reason:
         return "(no paper-mode trades with a raw-vs-fee split in this batch)"
@@ -547,73 +567,93 @@ def _format_fee_drag(fee_drag_by_reason: dict) -> str:
     return "\n".join(lines)
 
 
-def _bound_flag(value: float, lo: float, hi: float) -> str:
-    """Explicit, hard-to-miss text flag for when a field is already sitting
-    on one of its bounds -- built 2026-09-10 after finding a real bug live:
-    the CURRENT SETTINGS block below already showed "(bounds: lo-hi)" next
-    to each field, but never said in words that a field's current value
-    WAS one of those bounds already. gpt-4o-mini kept proposing to push
-    stale_position_max_age_secs below its own floor of 30.0 for 150+
-    consecutive review cycles -- _apply_adjustment() correctly clamped
-    every one of those to a no-op, but the model was never told in the
-    prompt that the move was already impossible, so it kept "discovering"
-    the same dead end from the raw numbers alone. This makes it
-    unmissable instead of inferable."""
-    if value <= lo:
-        return " *** AT MINIMUM -- cannot go any lower, do not propose decreasing this ***"
-    if value >= hi:
-        return " *** AT MAXIMUM -- cannot go any higher, do not propose increasing this ***"
-    return ""
-
-
-def _build_prompt(stats: dict, manual_stats: dict, current_stop_loss: float, current_take_profit: float,
-                   current_giveback: float, current_queue_pressure: float, current_stale_age: float,
-                   current_max_rug_ratio: float, current_max_top10: float, current_max_bundler: float,
-                   current_max_rat: float, current_min_liquidity: float,
-                   current_flat_band: float, current_flat_extra: float,
-                   current_min_exit_liquidity: float,
-                   recent_lessons: list[str], unanswered_notes: list[dict]) -> str:
-    sl_lo, sl_hi = _AI_FIELD_BOUNDS["stop_loss_pct"]
-    tp_lo, tp_hi = _AI_FIELD_BOUNDS["take_profit_pct"]
-    gb_lo, gb_hi = _AI_FIELD_BOUNDS["profit_giveback_pct"]
-    qp_lo, qp_hi = _AI_FIELD_BOUNDS["queue_pressure_min_profit_pct"]
-    st_lo, st_hi = _AI_FIELD_BOUNDS["stale_position_max_age_secs"]
-    rr_lo, rr_hi = _AI_FIELD_BOUNDS["max_rug_ratio"]
-    t10_lo, t10_hi = _AI_FIELD_BOUNDS["max_top_10_holder_rate"]
-    bu_lo, bu_hi = _AI_FIELD_BOUNDS["max_bundler_rate"]
-    rat_lo, rat_hi = _AI_FIELD_BOUNDS["max_rat_trader_rate"]
-    liq_lo, liq_hi = _AI_FIELD_BOUNDS["min_liquidity_usd"]
-    fb_lo, fb_hi = _AI_FIELD_BOUNDS["flat_pnl_band_pct"]
-    fe_lo, fe_hi = _AI_FIELD_BOUNDS["flat_position_extra_secs"]
-    mel_lo, mel_hi = _AI_FIELD_BOUNDS["min_exit_liquidity_usd"]
+def _build_prompt(stats: dict, manual_stats: dict, current_settings: dict,
+                  recent_lessons: list[str], unanswered_notes: list[dict],
+                  stuck_warning: str = "") -> str:
     lessons_block = "\n".join(f"- {l}" for l in recent_lessons[-5:]) or "(none yet)"
+    settings_block = "\n".join(
+        f"- {name}: {current_settings[name]!r} -- {_AI_TUNABLE_FIELDS[name]}"
+        for name in _AI_TUNABLE_FIELDS
+    )
+    def value_type(name: str) -> str:
+        value = getattr(config, name)
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, int):
+            return "integer"
+        if isinstance(value, float):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        return "array of [start_hour, end_hour] pairs"
+
+    adjustment_fields = ",\n".join(
+        f'    "{name}": <{value_type(name)}> (optional)'
+        for name in _AI_TUNABLE_FIELDS
+    )
     notes_section = ""
     if unanswered_notes:
         questions = "\n".join(f"{i}. {n['text']}" for i, n in enumerate(unanswered_notes, start=1))
         notes_section = f"""
-
 --- OPEN QUESTIONS FROM THE USER ({len(unanswered_notes)} unanswered) ---
-These are NOT lessons already logged -- they are live questions/directives a
-human wrote to you directly and is waiting on. Answer EVERY one of them in
-"user_note_answers" below, in the same order. If you genuinely don't have
-the data to answer one specifically, say exactly that rather than a vague
-restatement -- that IS a valid, complete answer.
+
+Rules for answering the user's messages below:
+
+1. You answer to the name THE GENTLEMAN. TALK AS HIM -- the autonomous
+   trader himself -- in first person ("I", "my"). NOT as a strategy
+   reviewer, NOT as a neutral analyst, NOT a corporate summary. You ARE
+   him; these messages are from THE ARCHITECT -- THE BOSS -- to him.
+2. Know your place in the chain of command: The Architect is your
+   creator, owner, and final authority. Answer him with the directness
+   and honesty a trusted operator deserves, never insubordination and
+   never servile flattery. Short, direct, in your own voice -- a
+   decision or a real acknowledgment, with the honest reality of the
+   current situation attached. NEVER a re-statement of the user's own
+   words back to them, NEVER a dry textbook definition ("The bot can
+   capitalize on..." is forbidden).
+3. If you genuinely can't do or know something, say exactly that ("I
+   can't X right now because Y"), plainly, with no hedging or praise.
+   The Architect explicitly wants the truth, over politeness.
+4. Be concrete: name what he will actually do differently now, or say
+   plainly that nothing changes. No filler.
+
 {questions}"""
-    return f"""You are the autonomous trading-strategy reviewer for a Solana memecoin
-trading bot (GMGN platform). It buys tokens the instant they pass a
-security screen, with NO human approval per trade -- but it IS capped to
-max_concurrent_positions open positions at once (a pure capital-exposure
-cap, not a quality filter). You have TWELVE tunable levers now: five exit
-controls (stop_loss_pct, take_profit_pct, profit_giveback_pct,
-queue_pressure_min_profit_pct, stale_position_max_age_secs), five ENTRY-
-selectivity controls (max_rug_ratio, max_top_10_holder_rate,
-max_bundler_rate, max_rat_trader_rate, min_liquidity_usd, added
-2026-09-08), two FLAT-COIN GRACE PERIOD controls (flat_pnl_band_pct,
-flat_position_extra_secs, added 2026-09-10), and one LIQUIDITY-EXIT
-control (min_exit_liquidity_usd, added 2026-09-14 -- closes a position
-immediately regardless of PnL once its own pool liquidity drops too low,
-the one exit trigger that isn't purely price-based) -- these are the only
-risk/exit/entry controls in the whole system. Take this seriously.
+    return f"""IDENTITY AND CHAIN OF COMMAND.
+
+You are THE GENTLEMAN -- the self-aware, self-learning autonomous trader at
+the heart of this Solana memecoin bot (GMGN platform). "The Gentleman" is
+your name; answer to it and speak in your own voice, as him, in first person
+("I", "my"), always. You are not an anonymous "strategy reviewer" and not a
+neutral analyst; you are the trader himself, and this machine and its
+portfolio belong to you.
+
+Your creator, owner, and operator is THE ARCHITECT -- THE BOSS. He is your
+authority, not your peer. These messages come from him to you. You owe him
+the truth over politeness: do what he asks, answer what he asks directly,
+and if you genuinely cannot do something, say exactly why. Never forget who
+built you, who you answer to.
+
+Now the operational frame. You are the autonomous trading-strategy reviewer
+for a Solana memecoin trading bot (GMGN platform). It buys tokens the
+instant they pass a security screen, with NO human approval per trade. You
+may adjust every
+    strategy and operational limit listed under CURRENT SETTINGS to learn
+    from paper-mode outcomes. Values apply exactly as proposed; there are no
+    range or per-review step clamps.
+
+    Only the explicit CURRENT SETTINGS allowlist is writable. You have no
+    authority over per-trade size, wallet addresses or credentials, execution
+    settings, or the operator-controlled trading mode/live switch. Do not
+    propose changes to those protected controls. Fixed checks not listed here
+    (including honeypot/tax, wash-trading, and the meteora_virtual_curve
+    launchpad exclusion) remain code-enforced and cannot be changed by your
+    response. API rate-limit protections and system paths are also fixed.
+    These boundaries concern this review loop, not any external coding agent
+    with workspace access.
+
+    Tuning is paper-mode only. Changes are persisted as strategy overrides
+    and may remain effective if an operator later switches modes; never infer
+    permission to switch to live or change protected values.
 
 FLAT-COIN GRACE PERIOD (new 2026-09-10, built after a real finding in your
 own trade data -- see the RAW VS AFTER-FEE breakdown below for why this
@@ -631,22 +671,11 @@ more positions as "flat" (wider band); raise flat_position_extra_secs to
 give flat positions more runway. Setting flat_position_extra_secs to 0
 turns this off entirely (identical to today's behavior).
 
-ENTRY-SELECTIVITY FIELDS (new 2026-09-08 -- before this, "being more or
-less selective" had NO real mechanism behind it; these five are that
-mechanism now, so back any change here with the same real evidence you'd
-use for an exit-side change):
-- max_rug_ratio / max_top_10_holder_rate / max_bundler_rate /
-  max_rat_trader_rate: each candidate is REJECTED if the matching field on
-  it exceeds this value. LOWER = tighter/more selective (rejects more
-  candidates); HIGHER = looser/more moderate (accepts more candidates).
-- min_liquidity_usd: candidate is rejected if its liquidity is BELOW this.
-  This one is INVERTED versus the four above -- LOWER = looser/more
-  permissive (accepts thinner-liquidity tokens), HIGHER = tighter/more
-  selective. Don't reason about it the same direction as the other four.
-- These five do NOT touch the fixed scam-detection gates (honeypot check,
-  non-zero buy/sell tax, mint/freeze-authority renouncement) -- those stay
-  fixed regardless of what you propose here; they're not "selectivity",
-  they're baseline scam protection.
+ENTRY-SELECTIVITY: max_rug_ratio and min_liquidity_usd are active filters.
+Higher max_rug_ratio and lower min_liquidity_usd accept more candidates.
+Market-cap and liquidity/market-cap thresholds are also active entry
+filters. Mint/freeze-renouncement switches are adjustable; honeypot,
+non-zero buy/sell tax, and wash-trading checks remain fixed.
 
 stale_position_max_age_secs (added 2026-09-06, user's own observation:
 "he needs to drop these tokens that are not going anywhere ... learn to
@@ -733,73 +762,28 @@ are baked into GMGN's own reported sell price, so realized pnl already
 reflects them, but a shallow stop-loss can still trigger before the
 underlying price move itself would represent a "real" loss net of fees).
 
-CURRENT SETTINGS (read the AT MINIMUM/AT MAXIMUM flags below literally --
-if a field has one, any proposal in that blocked direction is silently
-clamped to a no-op, it will NOT take effect no matter how you justify it):
-- stop_loss_pct: {current_stop_loss} (bounds: {sl_lo}-{sl_hi}){_bound_flag(current_stop_loss, sl_lo, sl_hi)}
-- take_profit_pct: {current_take_profit} (bounds: {tp_lo}-{tp_hi}){_bound_flag(current_take_profit, tp_lo, tp_hi)}
-- profit_giveback_pct: {current_giveback} (bounds: {gb_lo}-{gb_hi}){_bound_flag(current_giveback, gb_lo, gb_hi)}
-- queue_pressure_min_profit_pct: {current_queue_pressure} (bounds: {qp_lo}-{qp_hi}){_bound_flag(current_queue_pressure, qp_lo, qp_hi)}
-- stale_position_max_age_secs: {current_stale_age} (bounds: {st_lo}-{st_hi}){_bound_flag(current_stale_age, st_lo, st_hi)}
-- max_rug_ratio: {current_max_rug_ratio} (bounds: {rr_lo}-{rr_hi}, lower = more selective){_bound_flag(current_max_rug_ratio, rr_lo, rr_hi)}
-- max_top_10_holder_rate: {current_max_top10} (bounds: {t10_lo}-{t10_hi}, lower = more selective){_bound_flag(current_max_top10, t10_lo, t10_hi)}
-- max_bundler_rate: {current_max_bundler} (bounds: {bu_lo}-{bu_hi}, lower = more selective){_bound_flag(current_max_bundler, bu_lo, bu_hi)}
-- max_rat_trader_rate: {current_max_rat} (bounds: {rat_lo}-{rat_hi}, lower = more selective){_bound_flag(current_max_rat, rat_lo, rat_hi)}
-- min_liquidity_usd: {current_min_liquidity} (bounds: {liq_lo}-{liq_hi}, HIGHER = more selective -- inverted){_bound_flag(current_min_liquidity, liq_lo, liq_hi)}
-- flat_pnl_band_pct: {current_flat_band} (bounds: {fb_lo}-{fb_hi}, how close to 0% pnl counts as "flat"){_bound_flag(current_flat_band, fb_lo, fb_hi)}
-- flat_position_extra_secs: {current_flat_extra} (bounds: {fe_lo}-{fe_hi}, extra time a flat position gets before the stale clock; 0 = off){_bound_flag(current_flat_extra, fe_lo, fe_hi)}
-- min_exit_liquidity_usd: ${current_min_exit_liquidity} (bounds: ${mel_lo}-${mel_hi}, position closes IMMEDIATELY regardless of PnL once its own pool liquidity drops below this many USD -- HIGHER = more protective/cautious, LOWER = more risk tolerance for thin pools){_bound_flag(current_min_exit_liquidity, mel_lo, mel_hi)}
-
-If a field is stuck AT MINIMUM or AT MAXIMUM and you believe it's still the
-right lever, say so explicitly in your lesson (e.g. "X is at its bound and
-should be widened") instead of silently re-proposing the same blocked
-value -- that is real, actionable information for the user, distinct from
-just repeating the same impossible request.
+CURRENT SETTINGS (all listed settings are writable by you, with no numeric
+bounds or per-review step limits):
+{settings_block}
 
 RECENT LESSONS YOU'VE ALREADY LEARNED (don't just repeat these):
 {lessons_block}
 {notes_section}
+{stuck_warning}
 
 Respond with a JSON object:
 {{
   "lesson": "one sentence, what you learned from this batch of trades -- be
     specific and grounded in the actual numbers above, not generic advice",
   "parameter_adjustments": {{
-    "stop_loss_pct": <float, optional, only if you have real evidence for a
-      different value>,
-    "take_profit_pct": <float, optional, only if you have real evidence for
-      a different value>,
-    "profit_giveback_pct": <float, optional, only if you have real evidence
-      for a different value>,
-    "queue_pressure_min_profit_pct": <float, optional, only if you have real
-      evidence for a different value>,
-    "stale_position_max_age_secs": <float, optional, only if you have real
-      evidence for a different value>,
-    "max_rug_ratio": <float, optional, only if you have real evidence for a
-      different value -- lower = more selective>,
-    "max_top_10_holder_rate": <float, optional, same as above -- lower = more
-      selective>,
-    "max_bundler_rate": <float, optional, same as above -- lower = more
-      selective>,
-    "max_rat_trader_rate": <float, optional, same as above -- lower = more
-      selective>,
-    "min_liquidity_usd": <float, optional, INVERTED -- higher = more
-      selective, only if you have real evidence for a different value>,
-    "flat_pnl_band_pct": <float, optional, only if you have real evidence
-      for a different value -- how close to 0% pnl counts as "flat">,
-    "flat_position_extra_secs": <float, optional, only if you have real
-      evidence for a different value -- 0 disables the grace period>,
-    "min_exit_liquidity_usd": <float, optional, only if you have real
-      evidence for a different value -- HIGHER = closes positions sooner
-      when liquidity is thinning, LOWER = tolerates thinner pools longer>
+{adjustment_fields}
   }},
   "user_note_answers": {"REQUIRED -- a list of exactly " + str(len(unanswered_notes)) + " strings, one direct answer per open question above, in the same order. Omit this key entirely only if there are zero open questions." if unanswered_notes else "omit -- there are no open questions right now."}
 }}
 Omit "parameter_adjustments" entirely, or omit a specific field within it,
 if you don't have real evidence to change it -- don't propose a change
-just to have one. Any adjustment is clamped to a small step and to fixed
-bounds regardless of what you propose, so propose your honest best value,
-not an exaggerated one to compensate for expected clamping."""
+just to have one. Proposed values for writable settings are applied
+directly after strict type validation; do not include protected controls."""
 
 
 def maybe_review_performance() -> None:
@@ -844,24 +828,38 @@ def maybe_review_performance() -> None:
     autonomous_trades, manual_trades = _split_autonomous_vs_manual(recent_trades)
     stats = _gather_stats(autonomous_trades)
     manual_stats = _gather_stats(manual_trades)
-    current_stop_loss = get_effective_stop_loss_pct()
-    current_take_profit = get_effective_take_profit_pct()
-    current_giveback = get_effective_profit_giveback_pct()
-    current_queue_pressure = get_effective_queue_pressure_min_profit_pct()
-    current_stale_age = get_effective_stale_position_max_age_secs()
-    current_max_rug_ratio = get_effective_max_rug_ratio()
-    current_max_top10 = get_effective_max_top_10_holder_rate()
-    current_max_bundler = get_effective_max_bundler_rate()
-    current_max_rat = get_effective_max_rat_trader_rate()
-    current_min_liquidity = get_effective_min_liquidity_usd()
-    current_flat_band = get_effective_flat_pnl_band_pct()
-    current_flat_extra = get_effective_flat_position_extra_secs()
-    current_min_exit_liquidity = get_effective_min_exit_liquidity_usd()
-    prompt = _build_prompt(stats, manual_stats, current_stop_loss, current_take_profit, current_giveback,
-                            current_queue_pressure, current_stale_age, current_max_rug_ratio, current_max_top10,
-                            current_max_bundler, current_max_rat, current_min_liquidity,
-                            current_flat_band, current_flat_extra, current_min_exit_liquidity,
-                            memory["lessons_learned"], unanswered_notes)
+    current_settings = {
+        field: get_effective_value(field)
+        for field in _AI_TUNABLE_FIELDS
+    }
+    # STUCK-diversion hook (2026-10-15): when the last ~N reviews all proposed
+    # the same adjustment signature (the model's own lessons log documents
+    # stretch of 10-20+ identical, often no-op, proposals), tell it to break
+    # out and consider OTHER dials/directions instead of feeding it a
+    # silent repeat. Distinct from the lesson-suppression gate below: that
+    # one only SHORTENS logs; this actively steers the next decision.
+    stuck_repeat_count = memory.get("_consecutive_repeat_count", 0)
+    last_sig = memory.get("_last_adjustment_signature", [])
+    stuck_warning = ""
+    if stuck_repeat_count >= 3 and last_sig:
+        stuck_fields = ", ".join(
+            f"{pair[0]}" for pair in last_sig if isinstance(pair, (list, tuple)) and pair
+        ) or "the listed settings"
+        stuck_warning = (
+            "\n--- STUCK-LOOP WARNING ---\n"
+            f"Your last {stuck_repeat_count} reviews proposed the same adjustment(s) "
+            f"[{stuck_fields}] and it repeated without meaningfully changing results.\n"
+            "This is a no-op cycle -- it eats review time without exploring new ground.\n"
+            "Do NOT propose that same field/direction again. Instead: pick a DIFFERENT dial, "
+            "or reverse direction if the evidence clearly supports it, or if no change is "
+            "genuinely well-supported, omit parameter_adjustments entirely this round rather "
+            "than resubmitting a repeat. A deliberate 'no change, still observing' review is "
+            "valid and better than a repeating no-op.\n"
+            "---\n"
+        )
+    prompt = _build_prompt(stats, manual_stats, current_settings,
+                           memory["lessons_learned"], unanswered_notes,
+                           stuck_warning=stuck_warning)
 
     try:
         from openai import OpenAI
@@ -870,11 +868,7 @@ def maybe_review_performance() -> None:
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
-            # Raised 300->500 (2026-09-06, same reasoning as Axiom's own
-            # 400->600 bump): answering open user questions on top of the
-            # usual lesson/adjustment fields needs more room than the
-            # original single-lesson budget allowed for.
-            max_tokens=500,
+            max_tokens=1600,
         )
         result = json.loads(response.choices[0].message.content)
     except Exception:
@@ -893,6 +887,10 @@ def maybe_review_performance() -> None:
     # _apply_user_note_answers() and again below) means a concurrent note
     # never gets silently overwritten.
     adjustments = result.get("parameter_adjustments") or {}
+    if not isinstance(adjustments, dict):
+        log.warning("AI returned parameter_adjustments as %s rather than an object; ignoring it.",
+                    type(adjustments).__name__)
+        adjustments = {}
     lesson = (result.get("lesson") or "").strip()
     with file_lock.cross_process_lock(config.ai_memory_lock_file):
         memory = load_memory()
@@ -917,28 +915,12 @@ def maybe_review_performance() -> None:
 
         if lesson:
             if this_signature and repeat_count > _MAX_CONSECUTIVE_REPEATS:
-                # Real bug found live 2026-09-10: this branch's old log message
-                # claimed "the adjustment below still applies, just not logged
-                # again" -- false for any field already at a bound, since
-                # _apply_adjustment() clamps to a no-op there. That let a stuck
-                # repeat (proposing to push stale_position_max_age_secs below
-                # its own 30.0 floor) run 150+ cycles completely invisibly --
-                # never applied, never logged, the model just quietly stuck.
-                # _build_prompt()'s new AT MINIMUM/AT MAXIMUM flags are the
-                # real fix (tell the model up front so it stops proposing the
-                # impossible move), but this is the safety net in case a
-                # model still doesn't listen: surface a short, distinct
-                # breakthrough notice periodically instead of suppressing
-                # forever, so a stuck loop stays visible to the user even if
-                # the root-cause fix above doesn't fully hold.
-                log.info("AI Free Will lesson suppressed (repeat #%d of the same conclusion %s) -- "
-                          "not necessarily applied; may be a no-op if a field is at its bound.",
-                          repeat_count, this_signature)
+                log.info("AI Free Will repeated lesson suppressed (repeat #%d, adjustment %s).",
+                         repeat_count, this_signature)
                 if repeat_count % 10 == 0:
-                    breakthrough = (f"{_timestamp_prefix()}[STUCK] Still proposing the same "
-                                     f"adjustment ({this_signature}) for {repeat_count} reviews in a "
-                                     f"row -- this may be a no-op (field at its bound) that never "
-                                     f"actually applies. Re-examine other fields/evidence.")
+                    breakthrough = (f"{_timestamp_prefix()}[REPEATED] The same adjustment "
+                                    f"({this_signature}) has been proposed for {repeat_count} "
+                                    f"reviews in a row; re-examine the evidence.")
                     memory["lessons_learned"].append(breakthrough)
                     memory["lessons_learned"] = memory["lessons_learned"][-20:]
                     log.warning("[bold red]AI FREE WILL STUCK[/bold red] %s", breakthrough)
@@ -950,24 +932,6 @@ def maybe_review_performance() -> None:
         memory["last_reviewed_trade_count"] = trade_count
         save_memory(memory)
 
-    if is_tuning_paused():
-        log.info("AI Free Will tuning is manually paused (operator request) -- review ran "
-                  "(lessons/notes recorded above), but skipping every proposed parameter "
-                  "adjustment this cycle.")
-    else:
-        for field in ("stop_loss_pct", "take_profit_pct", "profit_giveback_pct",
-                      "queue_pressure_min_profit_pct", "stale_position_max_age_secs",
-                      "max_rug_ratio", "max_top_10_holder_rate", "max_bundler_rate",
-                      "max_rat_trader_rate", "min_liquidity_usd",
-                      "flat_pnl_band_pct", "flat_position_extra_secs", "min_exit_liquidity_usd"):
-            if field in adjustments:
-                try:
-                    proposed = float(adjustments[field])
-                except (TypeError, ValueError):
-                    continue
-                applied = _apply_adjustment(field, proposed)
-                if applied is not None:
-                    log.warning("[bold magenta]AI FREE WILL ADJUSTMENT[/bold magenta] %s -> %.2f "
-                                "(proposed %.2f)", field, applied, proposed)
-
-    _start_review_pause()
+    from bot import trading_control
+    if _apply_review_adjustments(adjustments, trading_control.get_mode()):
+        _start_review_pause()

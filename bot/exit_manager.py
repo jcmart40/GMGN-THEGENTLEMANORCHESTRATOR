@@ -46,7 +46,7 @@ _stop_loss_breach_started: dict[str, float] = {}
 
 def _has_queue_pressure() -> bool:
     """True if a "skipped_max_positions" entry exists in
-    cleared_candidates.json within config.queue_pressure_lookback_secs --
+    cleared_candidates.json within the effective queue-pressure lookback --
     i.e. a real, CURRENT candidate is being missed for lack of an open
     slot, not a stale skip from a while ago. Reads the same file
     bot/screener.py's _autonomous_buy() already writes to; no shared
@@ -58,7 +58,7 @@ def _has_queue_pressure() -> bool:
             data = json.load(f)
     except Exception:
         return False
-    cutoff = time.time() - config.queue_pressure_lookback_secs
+    cutoff = time.time() - ai_review.get_effective_value("queue_pressure_lookback_secs")
     return any(e.get("status") == "skipped_max_positions" and e.get("ts", 0) >= cutoff for e in data)
 
 
@@ -115,7 +115,7 @@ def _decide_exit_reason(address: str, pnl_pct: float, peak_pnl_pct: float | None
     stop-loss whipsaw guard's per-position confirmation tracking -- see
     _stop_loss_breach_started's own module-level comment. Liquidity is checked FIRST, ahead of everything
     else (2026-09-14, see bot/ai_review.py's
-    _AI_FIELD_BOUNDS["min_exit_liquidity_usd"] docstring for the real
+    AI-tunable strategy allowlist for the real
     incident this responds to): a genuinely dying pool doesn't care whether
     the position is currently up, down, or flat -- every price-based rule
     below is meaningless if there's nothing left to sell into by the time
@@ -161,11 +161,13 @@ def _decide_exit_reason(address: str, pnl_pct: float, peak_pnl_pct: float | None
     # floor below -- this catches a fast drain in progress, which is the
     # earlier, more useful warning than waiting for liquidity to cross a
     # fixed floor after most of it is already gone.
-    if (config.liquidity_drain_mcap_threshold_usd > 0 and config.liquidity_drain_pct > 0
-            and market_cap is not None and market_cap >= config.liquidity_drain_mcap_threshold_usd
+    liquidity_drain_mcap_threshold_usd = ai_review.get_effective_value("liquidity_drain_mcap_threshold_usd")
+    liquidity_drain_pct = ai_review.get_effective_value("liquidity_drain_pct")
+    if (liquidity_drain_mcap_threshold_usd > 0 and liquidity_drain_pct > 0
+            and market_cap is not None and market_cap >= liquidity_drain_mcap_threshold_usd
             and liquidity is not None and peak_liquidity is not None and peak_liquidity > 0):
         drain_pct = (peak_liquidity - liquidity) / peak_liquidity * 100.0
-        if drain_pct >= config.liquidity_drain_pct:
+        if drain_pct >= liquidity_drain_pct:
             _stop_loss_breach_started.pop(address, None)
             return "liquidity-drain"
     min_exit_liquidity = ai_review.get_effective_min_exit_liquidity_usd()
@@ -176,7 +178,8 @@ def _decide_exit_reason(address: str, pnl_pct: float, peak_pnl_pct: float | None
     # else below on purpose: this is a genuine "no matter what" cutoff,
     # unlike every other time-based rule in this function, which only
     # fires if nothing else already claimed the position.
-    if config.max_hold_secs > 0 and age_secs >= config.max_hold_secs:
+    max_hold_secs = ai_review.get_effective_value("max_hold_secs")
+    if max_hold_secs > 0 and age_secs >= max_hold_secs:
         _stop_loss_breach_started.pop(address, None)
         return "max-hold"
     stop_loss_pct = ai_review.get_effective_stop_loss_pct()
@@ -187,7 +190,8 @@ def _decide_exit_reason(address: str, pnl_pct: float, peak_pnl_pct: float | None
         # stop-loss line is not noise, waiting to "confirm" it only makes
         # the loss worse. See config.emergency_drawdown_pct's own docstring
         # for the two real incidents (RIM, OMG) this responds to.
-        if config.emergency_drawdown_pct > 0 and pnl_pct <= -config.emergency_drawdown_pct:
+        emergency_drawdown_pct = ai_review.get_effective_value("emergency_drawdown_pct")
+        if emergency_drawdown_pct > 0 and pnl_pct <= -emergency_drawdown_pct:
             _stop_loss_breach_started.pop(address, None)
             return "emergency-drawdown"
         # Whipsaw guard (2026-09-17) -- see _stop_loss_breach_started's own
@@ -196,12 +200,13 @@ def _decide_exit_reason(address: str, pnl_pct: float, peak_pnl_pct: float | None
         # recovers before then never reaches this branch again (the "else"
         # below clears the watch entry the next time this function runs
         # for the same address and finds pnl_pct back above the line).
-        if config.stop_loss_confirm_secs <= 0:
+        stop_loss_confirm_secs = ai_review.get_effective_value("stop_loss_confirm_secs")
+        if stop_loss_confirm_secs <= 0:
             return "stop-loss"
         first_breach = _stop_loss_breach_started.get(address)
         if first_breach is None:
             _stop_loss_breach_started[address] = time.time()
-        elif time.time() - first_breach >= config.stop_loss_confirm_secs:
+        elif time.time() - first_breach >= stop_loss_confirm_secs:
             return "stop-loss"
         # else: breaching, but not yet confirmed -- fall through to check
         # the other rules below (all of which require pnl_pct > 0 except
@@ -223,7 +228,8 @@ def _decide_exit_reason(address: str, pnl_pct: float, peak_pnl_pct: float | None
     # so it only ever makes losers/flats exit SOONER, never later. A
     # profitable-but-undecided position (pnl_pct > 0) skips this entirely
     # and keeps the normal stale_position_max_age_secs/flat-grace treatment.
-    if pnl_pct <= 0 and config.losing_position_max_age_secs > 0 and age_secs >= config.losing_position_max_age_secs:
+    losing_position_max_age_secs = ai_review.get_effective_value("losing_position_max_age_secs")
+    if pnl_pct <= 0 and losing_position_max_age_secs > 0 and age_secs >= losing_position_max_age_secs:
         return "stale-losing"
     stale_age = ai_review.get_effective_stale_position_max_age_secs()
     if age_secs >= stale_age:
@@ -287,7 +293,7 @@ async def _fetch_price(address: str, symbol: str | None) -> tuple[str, float | N
         except (TypeError, ValueError):
             market_cap = None
     # Liquidity (2026-09-14, see bot/ai_review.py's
-    # _AI_FIELD_BOUNDS["min_exit_liquidity_usd"] docstring) -- same field,
+    # AI-tunable strategy allowlist) -- same field,
     # same call, no extra API cost. USD-denominated (verified live against
     # a real token: platform showed "Liq $4.02K", this field returned
     # 3919.82 -- same convention config.min_liquidity_usd's entry check

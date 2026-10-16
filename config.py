@@ -101,10 +101,8 @@ class Config:
     max_rat_trader_rate: float = field(default_factory=lambda: _get_float("MAX_RAT_TRADER_RATE", 0.2))
     min_liquidity_usd: float = field(default_factory=lambda: _get_float("MIN_LIQUIDITY_USD", 3000.0))
     min_holder_count: int = field(default_factory=lambda: _get_int("MIN_HOLDER_COUNT", 10))
-    # Renounced mint/freeze authority -- required, not just scored, same
-    # reasoning Axiom-bot's own rug-check treats these as hard gates: an
-    # un-renounced mint authority means the dev can print more supply at
-    # will, un-renounced freeze means they can freeze anyone's tokens.
+    # Renounced mint/freeze authority -- defaults are required. The paper-
+    # mode AI reviewer may tune these switches based on observed outcomes.
     require_renounced_mint: bool = field(default_factory=lambda: _get_bool("REQUIRE_RENOUNCED_MINT", True))
     require_renounced_freeze: bool = field(default_factory=lambda: _get_bool("REQUIRE_RENOUNCED_FREEZE", True))
 
@@ -120,10 +118,9 @@ class Config:
     # that same live sample: 8% of candidates had negative net_buy_24h,
     # 12% had buys_24h < 3, 0% had is_wash_trading=True -- these starting
     # thresholds reject a meaningful minority, not the whole pipeline (the
-    # $12k liquidity floor mistake earlier today). Fixed, NOT AI-tunable
-    # for now -- zero historical evidence yet on whether these actually
-    # improve outcomes; let real paper-mode data prove it first, same as
-    # emergency_drawdown_pct/losing_position_max_age_secs above. Fail-closed
+    # $12k liquidity floor mistake earlier today). AI-tunable in paper mode
+    # so observed outcomes can shape these two strategy filters. The
+    # independent is_wash_trading check below remains fixed and fail-closed
     # on a missing field, same convention as every other check in
     # bot/security.py's check_trenches_fields() -- both fields were 100%
     # populated across the real 120-candidate sample, so this should be
@@ -164,14 +161,11 @@ class Config:
     #   "paper" -- approve simulates a fill against a REAL live price
     #              (bot/paper_trader.py) into a virtual portfolio. No
     #              gmgn-cli swap call, no real funds at risk.
-    #   "live"  -- NOT YET BUILT. gmgn-cli swap itself has no dry-run flag
-    #              (confirmed via `gmgn-cli swap --help`), and real swap
-    #              also needs its own CLI-level gate
-    #              (GMGN_ALLOW_AUTOMATED_TRADES=1) plus GMGN_PRIVATE_KEY
-    #              configured -- a deliberate later, higher-stakes step.
-    #              The dashboard rejects switching to "live" until that
-    #              executor is actually built, rather than accepting the
-    #              mode and silently doing nothing.
+    #   "live"  -- real swaps through bot/executor.py. Requires the separate
+    #              GMGN_ALLOW_AUTOMATED_TRADES=1 gate and GMGN_PRIVATE_KEY
+    #              in gmgn-cli's own local config. Only an operator should
+    #              set TRADING_MODE=live and restart; the AI reviewer has
+    #              no mode-setting path.
     trading_control_file: str = field(
         default_factory=lambda: os.getenv("TRADING_CONTROL_FILE", "logs/trading_control.json"))
     default_trading_mode: str = field(default_factory=lambda: os.getenv("TRADING_MODE", "off"))
@@ -194,6 +188,8 @@ class Config:
     # actually closed the trade (tui.py's manual hotkeys run in a SEPARATE
     # process from the screener -- this reads the shared
     # trade_history.json file, so it catches manual closes too).
+    # AI-tunable in paper mode; any override remains in effect if the
+    # operator later switches to live.
     max_live_trades_per_session: int = field(
         default_factory=lambda: _get_int("MAX_LIVE_TRADES_PER_SESSION", 3))
 
@@ -238,18 +234,12 @@ class Config:
     # fee drag found live -- wallet dropped ~0.169 SOL in one session while
     # closed-trade PnL only summed to about -0.02 SOL, the other ~0.15 SOL
     # being round-trip fees (~11-12% per trade, see the same-night fee
-    # measurement) across 14 rapid round trips. None of the AI's own tunable
-    # fields (entry-selectivity or exit thresholds) directly control trade
-    # FREQUENCY -- tightening entry-selectivity to reduce trade count was
-    # the same lever that caused the earlier 100%-rejection lockout, so it's
-    # not a safe knob to lean on for this. This is a separate, dedicated
+    # measurement) across 14 rapid round trips. This is a separate, dedicated
     # throttle: a flat minimum number of seconds between one buy and the
     # next, mode-agnostic like trade_burst_limit above, state in the same
     # trade_burst_state_file (a "last_trade_ts" field alongside the burst
-    # counter). Deliberately NOT AI-tunable -- an operator-level cost
-    # control, same category as trade_burst_limit/max_concurrent_positions,
-    # not something left to the AI's own judgment given tonight's repeated
-    # pattern of acknowledging a problem without fixing it. 0 disables.
+    # counter). AI-tunable in paper mode along with other trade-frequency
+    # strategy dials. 0 disables.
     min_time_between_trades_secs: float = field(
         default_factory=lambda: _get_float("MIN_TIME_BETWEEN_TRADES_SECS", 10.0))
 
@@ -270,6 +260,7 @@ class Config:
     # anything already open when a pause window starts, same reasoning as
     # every other pause mechanism in this project.
     time_pause_enabled: bool = field(default_factory=lambda: _get_bool("TIME_PAUSE_ENABLED", True))
+    # Both the enable switch and UTC windows are AI-tunable in paper mode.
     time_pause_windows_utc: list[tuple[float, float]] = field(
         default_factory=lambda: _parse_hour_windows(
             os.getenv("TIME_PAUSE_WINDOWS_UTC", "4-5,11-13,15-16,19-20,21-22")))
@@ -359,7 +350,7 @@ class Config:
     # How far back to look in cleared_candidates.json for a
     # "skipped_max_positions" entry to count as CURRENT backlog pressure --
     # an old skip from an hour ago doesn't mean anything is waiting right
-    # now.
+    # now. AI-tunable in paper mode.
     queue_pressure_lookback_secs: float = field(
         default_factory=lambda: _get_float("QUEUE_PRESSURE_LOOKBACK_SECS", 60.0))
 
@@ -406,22 +397,17 @@ class Config:
     # extends the existing clock).
     flat_position_extra_secs: float = field(default_factory=lambda: _get_float("FLAT_POSITION_EXTRA_SECS", 120.0))
 
-    # losing_position_max_age_secs (2026-09-17, user + son's explicit
-    # request to combat the stop-loss-dominated rough patch): a position
-    # that is NOT currently in profit (pnl_pct <= 0) gets cut on this much
-    # shorter clock instead of waiting for the full stale_position_max_age_secs
-    # -- stops a sideways-or-negative position from lingering all the way
-    # down to the stop-loss floor. Deliberately a SEPARATE field from
-    # stale_position_max_age_secs, not a change to it: a genuinely
-    # profitable-but-undecided position still gets the full normal stale
-    # clock to develop, only losers/flats get the fast exit. Also
-    # deliberately fixed, not AI-tunable (same category as
-    # min_market_cap_usd/max_market_cap_usd above) -- this is an operator
-    # decision responding to a specific real incident, not a strategy dial.
+    # losing_position_max_age_secs (2026-09-17, updated 2026-10-12 per
+    # user's standing two-minute rule): a position that is NOT currently
+    # in profit (pnl_pct <= 0) gets cut after 120 seconds instead of waiting
+    # for the full stale_position_max_age_secs. Profitable positions skip
+    # this cutoff and continue under their normal exit rules. Deliberately
+    # a SEPARATE field from stale_position_max_age_secs, not a change to it.
+    # AI-tunable in paper mode as part of the losing-position exit strategy.
     # Checked in bot/exit_manager.py's _decide_exit_reason() ahead of the
     # normal stale/flat-grace check.
     losing_position_max_age_secs: float = field(
-        default_factory=lambda: _get_float("LOSING_POSITION_MAX_AGE_SECS", 75.0))
+        default_factory=lambda: _get_float("LOSING_POSITION_MAX_AGE_SECS", 120.0))
 
     # stop_loss_confirm_secs (2026-09-17, user + son's explicit request to
     # prevent early whipsaws during choppy price action): the stop-loss
@@ -434,8 +420,7 @@ class Config:
     # the "early whipsaw" scenario this responds to. 0 disables the guard
     # entirely (fires instantly on the very first breaching tick, the
     # previous behavior), same disable convention every other threshold in
-    # this project uses. Fixed, NOT AI-tunable -- a safety mechanism, not a
-    # strategy dial.
+    # this project uses. AI-tunable in paper mode as an exit-strategy dial.
     stop_loss_confirm_secs: float = field(
         default_factory=lambda: _get_float("STOP_LOSS_CONFIRM_SECS", 10.0))
 
@@ -455,8 +440,7 @@ class Config:
     # incidents above -- 15.0 would have caught RIM right as it crossed
     # this line instead of letting it ride to -15.4%, and OMG even sooner.
     # 0 disables (falls back to the full confirm-window behavior for every
-    # breach, no severity exception). Fixed, NOT AI-tunable -- a safety
-    # mechanism, not a strategy dial, same category as stop_loss_confirm_secs.
+    # breach, no severity exception). AI-tunable in paper mode.
     emergency_drawdown_pct: float = field(
         default_factory=lambda: _get_float("EMERGENCY_DRAWDOWN_PCT", 15.0))
 
@@ -479,8 +463,7 @@ class Config:
     # price they happen to be at that exact moment, not their eventual
     # take-profit price. Granularity bounded by exit_check_interval_secs
     # (currently 2.0s) -- this can't fire more precisely than that poll
-    # cycle allows. 0 disables entirely. Fixed, NOT AI-tunable -- a hard
-    # operator ceiling, not a strategy dial.
+    # cycle allows. 0 disables entirely. AI-tunable in paper mode.
     max_hold_secs: float = field(
         default_factory=lambda: _get_float("MAX_HOLD_SECS", 5.0))
 
@@ -488,9 +471,9 @@ class Config:
     # regardless of current PnL, the moment its own pool liquidity (USD --
     # verified live against a real token, same convention min_liquidity_usd
     # above uses -- same get_token_info() field bot/exit_manager.py already
-    # fetches every check cycle) drops below this. See bot/ai_review.py's
-    # _AI_FIELD_BOUNDS["min_exit_liquidity_usd"] docstring for the real
-    # incident (9 positions lost 96-99.8% each) this responds to.
+    # fetches every check cycle) drops below this. The paper-mode reviewer
+    # may tune this after the nine-position liquidity-loss incident it
+    # responds to.
     min_exit_liquidity_usd: float = field(default_factory=lambda: _get_float("MIN_EXIT_LIQUIDITY_USD", 200.0))
 
     exit_check_interval_secs: float = field(default_factory=lambda: _get_float("EXIT_CHECK_INTERVAL_SECS", 5.0))
@@ -513,9 +496,8 @@ class Config:
     # burn through the wallet that fast"). This is the ONE entry-side
     # limit reintroduced after the earlier "no guardrails on entries"
     # direction -- a pure capital-exposure cap, not a risk/quality filter
-    # (bot/security.py's screening is untouched). Checked in
-    # bot/screener.py's _autonomous_buy() against however many positions
-    # are open in whichever mode is currently active (paper or live).
+    # (bot/security.py's screening is untouched). AI-tunable in paper mode;
+    # checked against open positions in the active mode.
     max_concurrent_positions: int = field(default_factory=lambda: _get_int("MAX_CONCURRENT_POSITIONS", 3))
 
     # Market cap trading band (2026-09-16, user's explicit, real-data-backed
@@ -529,11 +511,8 @@ class Config:
     # anything, but still costs real fee/slippage drag every time it's
     # bought -- a small, consistent, avoidable loss.
     #
-    # Hard-coded, NOT one of the AI's 12 tunable levers -- same category as
-    # max_concurrent_positions above and the meteora_virtual_curve exclusion
-    # in bot/security.py: a categorical trading-band boundary the user
-    # decided directly from real evidence, not a strategy dial left to the
-    # AI's own judgment. Applied in BOTH bot/security.py's check_trenches_fields()
+    # AI-tunable in paper mode. Applied in BOTH
+    # bot/security.py's check_trenches_fields()
     # (original screening) and check_arbitrary_token_candidate() (the shared
     # check wallet_follow/dev_snipe/skyeye_copy/token_snipe/snipex all use)
     # so every signal source is held to the exact same boundary -- no
@@ -555,8 +534,8 @@ class Config:
     # while still being wildly lopsided relative to each other (e.g. $15k
     # liquidity against a $500k market cap passes both absolute checks but
     # is a 3% ratio, exactly the "top-heavy" pattern this targets). Same
-    # category as min/max_market_cap_usd -- hard-coded, NOT one of the AI's
-    # tunable levers, applied in BOTH check_trenches_fields() and
+    # category as min/max_market_cap_usd -- AI-tunable in paper mode, applied
+    # in BOTH check_trenches_fields() and
     # check_arbitrary_token_candidate() so every signal source is held to
     # the same boundary. <= 0 disables it, same convention as every other
     # disable-able threshold here.
@@ -577,8 +556,7 @@ class Config:
     # String, not a float -- gmgn-cli's own duration format (e.g. "30s",
     # "5m"), passed through verbatim, no parsing done on this side. Empty
     # string disables the filter entirely (falls back to GMGN's own
-    # default, unfiltered ordering). Fixed, NOT AI-tunable -- an operator
-    # strategy decision, not a threshold the AI's own review should drift.
+    # default, unfiltered ordering). AI-tunable in paper mode.
     new_creation_max_age: str = field(
         default_factory=lambda: os.getenv("NEW_CREATION_MAX_AGE", "30s"))
 
@@ -599,9 +577,8 @@ class Config:
     # relying on holder-concentration/sniper/bundler metrics as the risk
     # signal at this stage -- user's own observation is that those tend to
     # hold their position once market cap is healthy, so liquidity itself
-    # draining is the more honest tell. Fixed, NOT AI-tunable -- an operator
-    # strategy decision the user set directly, same category as
-    # emergency_drawdown_pct/max_hold_secs. <= 0 on either disables the
+    # draining is the more honest tell. AI-tunable in paper mode.
+    # <= 0 on either disables the
     # whole rule, same convention as every other disable-able threshold
     # here. 30% chosen as a starting default for "drop quick" -- no real
     # trade data yet at the time this was built to calibrate a precise
@@ -620,6 +597,7 @@ class Config:
     # Gives a just-adjusted parameter a clean gap before more trades pile
     # up under it, rather than the review running mid-buy-stream with no
     # visible effect.
+    # AI-tunable in paper mode; 0 disables the pause.
     post_review_pause_secs: float = field(default_factory=lambda: _get_float("POST_REVIEW_PAUSE_SECS", 120.0))
 
     # -- Trade history (bot/trade_history.py) ----------------------------
@@ -695,7 +673,7 @@ class Config:
     # gmgn has on cented I want to use cented." Do not second-guess this
     # choice in code or comments elsewhere -- it's settled.
     wallet_follow_address: str = field(
-        default_factory=lambda: os.getenv("WALLET_FOLLOW_ADDRESS", "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o"))
+        default_factory=lambda: os.getenv("WALLET_FOLLOW_ADDRESS", ""))
     # Must be tracked via GMGN's own platform "Track" button FIRST -- the
     # `--wallet` filter on `gmgn-cli track follow-wallet` only returns
     # trades for wallets already on THIS account's own follow list (real
@@ -952,10 +930,11 @@ class Config:
 
     # -- AI Free Will review loop (bot/ai_review.py) ---------------------
     # Mirrors Axiom-bot's own bot/performance_evaluator.py -- periodic
-    # OpenAI review of recent closed trades, may adjust stop_loss_pct/
-    # take_profit_pct within bounded steps, writes lessons to a memory
-    # file. Built 2026-09-06, user's own explicit request ("he needs to
-    # be fully aware and self-learning with free will"). Adjustments are
+    # OpenAI review of recent closed trades, may adjust allowlisted
+    # strategy settings without bounds or per-review step limits while in
+    # paper mode, and writes lessons to a memory file. Built 2026-09-06,
+    # user's own explicit request ("he needs to be fully aware and
+    # self-learning with free will"). Adjustments are
     # applied via ai_overrides_file, re-read live by bot/exit_manager.py
     # every check cycle (NOT this static config object) so a change takes
     # effect immediately, no restart -- same reasoning Axiom-bot's own
@@ -967,6 +946,10 @@ class Config:
     xai_api_key: str = field(default_factory=lambda: os.getenv("XAI_API_KEY", ""))
     ai_review_every_n_trades: int = field(default_factory=lambda: _get_int("AI_REVIEW_EVERY_N_TRADES", 5))
     ai_memory_file: str = field(default_factory=lambda: os.getenv("AI_MEMORY_FILE", "logs/ai_memory.json"))
+    gentleman_chat_log_file: str = field(
+        default_factory=lambda: os.getenv("GENTLEMAN_CHAT_LOG_FILE", "logs/gentleman_chat.jsonl"))
+    gentleman_chat_log_lock_file: str = field(
+        default_factory=lambda: os.getenv("GENTLEMAN_CHAT_LOG_LOCK_FILE", "logs/gentleman_chat.lock"))
     ai_overrides_file: str = field(
         default_factory=lambda: os.getenv("AI_OVERRIDES_FILE", "logs/ai_overrides.json"))
     # Cross-process locks (2026-09-09, same real bug class as
@@ -993,6 +976,44 @@ class Config:
         default_factory=lambda: _get_float("AI_JUDGMENT_INTERVAL_SECS", 5.0))
     ai_judgment_log_file: str = field(
         default_factory=lambda: os.getenv("AI_JUDGMENT_LOG_FILE", "logs/ai_judgment_log.json"))
+
+    # -- Voice interaction (bot/voice_io.py, tui.py `v` hotkey) ------------
+    # Built 2026-10-15 at the user's explicit request for hands-free
+    # command/alert while watching the dashboard. Deliberately OFF by
+    # default -- the mic never opens on its own, first run is a deliberate
+    # .env flip, same "harder to trigger by accident" reasoning that
+    # retired the `l` hotkey after the 2026-09-16 live-mode incident.
+    voice_enabled: bool = field(default_factory=lambda: _get_bool("VOICE_ENABLED", False))
+    # tiny/base/small -- local faster-whisper only, no API keys by design.
+    voice_stt_model: str = field(default_factory=lambda: os.getenv("VOICE_STT_MODEL", "tiny"))
+    voice_stt_compute: str = field(default_factory=lambda: os.getenv("VOICE_STT_COMPUTE", "int8"))
+    # Spoken alerts (position closed / buy fired) independent of the mic.
+    voice_speak_alerts: bool = field(default_factory=lambda: _get_bool("VOICE_SPEAK_ALERTS", True))
+    # Spoken echo of every command result too (arming, refusals, closes).
+    voice_speak_feedback: bool = field(default_factory=lambda: _get_bool("VOICE_SPEAK_FEEDBACK", True))
+    # Substring of the Windows SAPI voice name ("David", "Zira", ...) --
+    # empty keeps the system default.
+    voice_tts_voice: str = field(default_factory=lambda: os.getenv("VOICE_TTS_VOICE", ""))
+    # sounddevice input device index (see the voice_io input[N] lines it
+    # logs at startup). -1 = the Windows default. PREFER voice_input_name
+    # over this: indices RENUMBER whenever a device is enabled/disabled
+    # (proved live 2026-10-15: enabling Microphone Array shifted every
+    # PortAudio index on this machine), so a hardcoded number silently
+    # binds to a different device after any Windows sound change.
+    voice_input_device: int = field(default_factory=lambda: _get_int("VOICE_INPUT_DEVICE", -1))
+    # Substring match against device names from the startup diagnostic
+    # (e.g. "Microphone Array", "Realtek HD Audio Mic"). Resolved EVERY
+    # boot, so it survives renumbering. Wins over voice_input_device.
+    voice_input_name: str = field(
+        default_factory=lambda: os.getenv("VOICE_INPUT_NAME", "Microphone Array"))
+    voice_tts_rate: int = field(default_factory=lambda: _get_int("VOICE_TTS_RATE", 185))
+    # Money-touching voice actions (sell all / close N / shutdown) must be
+    # RE-SPOKEN as "confirm" within this window before executing -- any
+    # other utterance cancels. The keyboard does these zero-confirm;
+    # voice earns the extra gate because a mis-heard word is a worse
+    # accidental trigger than a mis-pressed key (2026-09-16 "l" incident).
+    voice_confirm_window_secs: float = field(
+        default_factory=lambda: _get_float("VOICE_CONFIRM_WINDOW_SECS", 8.0))
 
 
 config = Config()

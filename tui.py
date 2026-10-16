@@ -47,6 +47,13 @@ Hotkeys:
          awareness comes from the header's bold mode badge, not a dialog.
     q    Quit the dashboard. bot/screener.py keeps running independently
          (same "main.py keeps running" message Axiom's own tui.py prints).
+    v    Voice toggle (2026-10-15, bot/voice_io.py) -- arms/disarms the
+         mic. Requires VOICE_ENABLED=true in .env; the Gentleman answers
+         in speech and narrates closed trades whenever running. Voice
+         commands never exceed the keyboard's authority, and money-
+         touching ones must be repeated ("confirm") inside a short
+         window -- the 2026-09-16 "l" incident is exactly why. Say
+         "help" while armed for the full command list.
 
 Keyboard input uses msvcrt (stdlib, Windows), same reasoning as Axiom-bot's
 own tui.py: curses isn't available on stock Windows Python, and the
@@ -76,8 +83,30 @@ import bot.trade_history as trade_history
 import bot.trading_control as trading_control
 from config import config
 
+# Voice layer (bot/voice_io.py, 2026-10-15). Imported here ONLY as a
+# cheap module import -- the heavy deps (faster-whisper, sounddevice,
+# pyttsx3, numpy) load inside its worker threads at start(), so an
+# import failure can't stop the dashboard booting. None until main()
+# builds it (VOICE_ENABLED=true); every call site checks for None.
+try:
+    from bot.voice_io import VoiceIO
+except Exception:  # noqa: BLE001 -- dashboard must still boot without voice deps
+    VoiceIO = None
+
 console = Console()
 log = logging.getLogger("gmgn-agent")
+
+_voice: "VoiceIO | None" = None
+# Spoken-command confirmation state (money-touching intents only):
+# (pending_intent, payload, expiry_ts). The operator must RE-SPEAK
+# "confirm" before the expiry; any other utterance cancels instead of
+# acting. tui.py-local rather than VoiceIO state on purpose: it gates
+# trading actions, which by this file's own philosophy live on this side
+# of the boundary, not the plumbing side.
+_voice_pending: tuple[str, dict, float] | None = None
+# Whether the operator's `v` voice SESSION is active (as opposed to the
+# mic stream, which voice_io opens/closes per utterance underneath).
+_voice_session = False
 
 REFRESH_SECS = 0.5          # same rate Axiom's own tui.py settled on -- snappy
                             # for a human-watched dashboard without hammering
@@ -167,8 +196,27 @@ def _header(status_msg: str) -> Panel:
             title, ("   ", ""),
             (f"⏸ MIN INTERVAL — {min_interval_remaining:.0f}s remaining", "bold black on cyan"),
         )
+    # Voice badge (2026-10-15) -- same "surface it in the header, not
+    # buried" convention as the two cooldown badges above: the operator
+    # must always be able to see, at a glance, whether the mic is live.
+    # Reads the SESSION flag, not voice_io's per-utterance listening state
+    # -- that one flickers off between captures while the session is on,
+    # which would make the badge blink confusingly.
+    if _voice is not None:
+        if _voice_session and _voice.listening:
+            title = Text.assemble(title, ("   ", ""), ("● LISTENING", "bold black on green"))
+        elif _voice_session:
+            title = Text.assemble(title, ("   ", ""), ("● armed", "bold green"))
+        elif _voice.stt_warming:
+            title = Text.assemble(title, ("   ", ""), ("○ voice loading…", "dim"))
+        elif _voice.stt_error:
+            title = Text.assemble(title, ("   ", ""), ("× voice down", "bold red"))
+        else:
+            title = Text.assemble(title, ("   ", ""), ("○ voice idle (v)", "dim"))
     rest = Text(
-        "   s = SELL ALL   1-9 = Close Position #   o/k = SHUTDOWN   r/l = Mode Paper/Live   q = Quit   ",
+        "   s = SELL ALL   1-9 = Close Position #   o/k = SHUTDOWN   r/l = Mode Paper/Live   "
+        + ("v = Voice   " if _voice is not None else "")
+        + "q = Quit   ",
         style="dim",
     )
     sub = Text(status_msg, style="bold cyan") if status_msg else rest
@@ -766,7 +814,33 @@ def _open_position_rows() -> list[tuple[str, str]]:
     return [(kind, addr) for kind, addr, _ in _open_position_entries()]
 
 
-def _close_one(kind: str, address: str) -> str:
+_CLOSE_RETRY_ATTEMPTS = 3          # manual 1-9 close retries on transient failures (2026-10-14)
+_CLOSE_RETRY_SLEEP_SECS = 3.0      # between attempts; GMGN 429 bans reset ~30-40s, pool-route errors are instant
+_CLOSE_RETRYABLE_MARKERS = (
+    "blocked", "failed", "rejected", "implausible",
+    "rate limit", "little pool", "routeerr",
+)
+_CLOSE_STOP_MARKERS = ("no open", "not open", "no position")
+
+
+def _retryable_close_failure(msg: str) -> bool:
+    """True if a close result string is a transient failure worth retrying
+    (GMGN rate-limit/ban, illiquid-pool route error, implausible quote) --
+    and NOT a definitive condition (position genuinely gone). Every closed
+    failure path restores the position before returning, so retrying is
+    always safe: it either eventually closes, or comes back to the exact
+    same untouched state."""
+    low = msg.lower()
+    if any(m in low for m in _CLOSE_STOP_MARKERS):
+        return False
+    return any(m in low for m in _CLOSE_RETRYABLE_MARKERS)
+
+
+def _close_one_attempt(kind: str, address: str) -> str:
+    """One single close attempt for one position. Same shape as the old
+    _close_one() -- kept as its own function so _close_one() can retry
+    transient failures around it. Everything here restores the position
+    on failure, never fabricates a result."""
     if kind == "paper":
         try:
             closed = paper_trader.simulate_sell(address, reason="manual")
@@ -798,6 +872,30 @@ def _close_one(kind: str, address: str) -> str:
             # swap is submitted) -- safe to retry later or leave as a known
             # stuck/illiquid position.
             return f"Live sell FAILED for {address[:8]} (still open, nothing sold): {exc}"
+
+
+def _close_one(kind: str, address: str) -> str:
+    """Close one position, bounded-retrying transient failures. Found live
+    2026-10-14: pressing 1-9 while GMGN had the IP rate-limited/banned
+    failed on the FIRST attempt and the position stayed open with almost
+    no visible feedback -- the operator had to sell the position by hand
+    on GMGN. Now: one attempt, then up to N-1 retries with a short pause
+    only when the result is a transient failure (rate-limit ban, illiquid-
+    pool route error, implausible quote); definitive results ("no open
+    position") return immediately; a success returns immediately.
+    Worst case the button costs a few extra seconds and reports the
+    position is still open -- it never fabricates a close. The brief
+    sleep blocks the refresh loop the same way the 'n' note prompt does --
+    acceptable for a rare manual action."""
+    last = _close_one_attempt(kind, address)
+    for attempt in range(1, _CLOSE_RETRY_ATTEMPTS):
+        if not _retryable_close_failure(last):
+            return last
+        time.sleep(_CLOSE_RETRY_SLEEP_SECS * attempt)
+        last = _close_one_attempt(kind, address)
+    if "rate limit" in last.lower() or "429" in last.lower() or "banned" in last.lower():
+        last += " GMGN is rate-limiting you right now -- sell on GMGN directly if urgent, or retry in ~30-40s."
+    return last
 
 
 def _close_position_by_index(n: int) -> str:
@@ -894,6 +992,25 @@ def _handle_key(ch: bytes) -> str:
     if key.isdigit() and key != "0":
         return _close_position_by_index(int(key))
 
+    if key == "v":
+        # Voice toggle (2026-10-15). Session-level: the mic stream
+        # opens/closes underneath via voice_io per utterance; `v` only
+        # flips whether the dashboard keeps re-arming it. When voice is
+        # off, `_voice` is None and this honestly says so rather than
+        # silently doing nothing -- same reason `l` now explains itself.
+        global _voice_session, _voice_pending
+        if _voice is None:
+            return "Voice is off -- set VOICE_ENABLED=true in .env and restart the dashboard."
+        if _voice_session:
+            _voice_session = False
+            _voice_pending = None
+            return _voice.disable_listening()
+        msg, ok = _voice.arm_voice()
+        _voice_session = ok
+        if ok and config.voice_speak_feedback:
+            _voice.speak("Voice armed.")   # worker's echo gate holds the mic
+        return msg                          # until this finishes playing
+
     if key in ("o", "k"):
         # Both keys do the same thing -- "k" for the same muscle-memory
         # reason Axiom-bot's own kill switch uses "k" (2026-09-07, user's
@@ -923,9 +1040,162 @@ def _handle_key(ch: bytes) -> str:
     return ""
 
 
+# --- voice commands ------------------------------------------------------------
+#
+# Maps voice_io's intents onto the exact same action functions the
+# keyboard uses -- ZERO new trading logic here, deliberately: voice is a
+# second input channel onto the existing keyset, never a third engine.
+# Money-touching intents (sell_all/close_one/shutdown/paper) require a
+# spoken "confirm" within config.voice_confirm_window_secs first. The
+# keyboard does these same actions zero-confirm -- a key is physically
+# unambiguous, a transcription is not (see the `l`-incident comment in
+# _handle_key above).
+
+_VOICE_ACTION_INTENTS = ("sell_all", "close_one", "shutdown", "paper")
+
+_VOICE_HELP_TEXT = (
+    "Voice commands: 'sell all', 'close position one to nine', 'shutdown', 'go paper', "
+    "'status', 'balance', 'note to the gentleman ...', 'help', 'voice off'. "
+    "Money actions ask for a spoken 'confirm'. Live mode cannot be armed by voice at all."
+)
+
+
+def _voice_say(msg: str) -> None:
+    if _voice is not None and config.voice_speak_feedback:
+        _voice.speak(msg)
+
+
+def _describe_pending(intent: str, payload: dict) -> str:
+    if intent == "sell_all":
+        return f"SELL ALL {len(_open_position_rows())} open position(s)"
+    if intent == "close_one":
+        return f"close position #{payload.get('index')}"
+    if intent == "shutdown":
+        return "SHUTDOWN -- trading mode -> OFF"
+    if intent == "paper":
+        return "trading mode -> PAPER"
+    return intent
+
+
+def _voice_execute(intent: str, payload: dict) -> str:
+    """Runs the action itself -- shared by the confirm path. Return
+    strings match the keyboard handlers exactly so downstream code can't
+    tell which input channel fired."""
+    if intent == "sell_all":
+        return _sell_all_positions()
+    if intent == "close_one":
+        return _close_position_by_index(int(payload.get("index", 0)))
+    if intent == "shutdown":
+        trading_control.set_mode("off")
+        return "SHUTDOWN -- Trading mode -> OFF. New buys stopped; open positions still exit normally."
+    if intent == "paper":
+        trading_control.set_mode("paper")
+        return "Trading mode -> PAPER."
+    return ""
+
+
+def _handle_voice_command(cmd) -> str:
+    global _voice_pending
+    intent = cmd.intent
+
+    if intent is None:
+        # Unmatched audio: never acted on, and NOT echoed to the status
+        # line either (a status line full of "didn't understand: <room
+        # noise>" buries the real messages). voice_io logged it.
+        return ""
+
+    if intent == "cancel":
+        if _voice_pending:
+            _voice_pending = None
+            return "Voice action cancelled."
+        return ""
+
+    pending = _voice_pending
+    if pending:
+        intent_name, payload_payload, expires = pending
+        if time.time() > expires:
+            _voice_pending = None
+            _voice_say("Confirmation window expired. Action not taken.")
+            return f"Voice {_describe_pending(intent_name, payload_payload)} NOT confirmed in time -- cancelled."
+        if intent == "confirm":
+            _voice_pending = None
+            return _voice_execute(intent_name, payload_payload)
+        # Any other utterance while a confirm is pending: cancel rather
+        # than chain. A half-heard follow-up sentence must never inherit
+        # a yes that wasn't heard clearly. The current utterance is
+        # dropped too (not re-dispatched this pass) -- safest reading of
+        # "did you mean to answer the confirm?".
+        _voice_pending = None
+        return f"Voice action cancelled: {_describe_pending(intent_name, payload_payload)} not confirmed."
+
+    if intent == "confirm":
+        return "Nothing to confirm."
+
+    if intent == "voice_off":
+        global _voice_session
+        _voice_session = False
+        return _voice.disable_listening()
+
+    if intent == "help":
+        _voice_say(_VOICE_HELP_TEXT)
+        return _VOICE_HELP_TEXT
+
+    if intent == "status":
+        rows = _combined_open_positions()
+        unrealized = _unrealized_pnl_sol(rows)
+        mode = trading_control.get_mode().upper()
+        realized = 0.0
+        try:
+            realized = sum(t.get("pnl_sol", 0.0)
+                           for t in trade_history.load_trades() if t.get("pnl_sol") is not None)
+        except Exception:  # noqa: BLE001 -- status readout must never raise
+            log.exception("tui.py: voice status realized-PnL read failed")
+        msg = (f"{mode} mode. {len(rows)} open. Unrealized {unrealized:+.3f} SOL. "
+               f"Realized {realized:+.3f} SOL.")
+        _voice_say(f"{mode} mode. {len(rows)} open positions. "
+                   f"Unrealized {unrealized:+.2f} sol, realized {realized:+.2f} sol.")
+        return msg
+
+    if intent == "note":
+        text = str(cmd.payload.get("text") or "").strip()
+        if not text:
+            return "Note was empty -- nothing sent."
+        try:
+            ai_review.write_user_note(text)
+        except Exception as exc:  # noqa: BLE001 -- same reason as _prompt_user_note's guard
+            log.exception("tui.py: voice note failed.")
+            return f"Failed to send note (see log): {exc}"
+        preview = text if len(text) <= 60 else text[:60] + "..."
+        _voice_say(f"Note sent: {preview}")
+        return f"Voice note sent to AI: {preview}"
+
+    if intent == "live_refused":
+        # Exactly the `l`-key policy (2026-09-16 incident, see _handle_key):
+        # live mode needs .env + a restart. A voice mis-hear flipping
+        # paper -> live is a strictly worse version of a stray keypress.
+        return ("Going live is disabled from the dashboard entirely -- "
+                "set TRADING_MODE=live in .env and restart the bot instead.")
+
+    if intent in _VOICE_ACTION_INTENTS:
+        _voice_pending = (intent, dict(cmd.payload), time.time() + config.voice_confirm_window_secs)
+        ask = f"{_describe_pending(intent, cmd.payload)} -- say confirm, or cancel."
+        _voice_say(ask)
+        return ask
+
+    return ""
+
+
 def main() -> None:
+    global _voice, _voice_session
     status_msg = ""
     status_expiry = 0.0
+    if config.voice_enabled and VoiceIO is not None:
+        # start() returns immediately -- model download/load happens on the
+        # voice threads, surfaced via the header badge, never on this path.
+        _voice = VoiceIO()
+        _voice.start()
+    elif config.voice_enabled:
+        log.warning("tui.py: VOICE_ENABLED=true but voice_io failed to import -- running voiceless.")
     with Live(render(), console=console, screen=True, refresh_per_second=10) as live:
         last_refresh = 0.0
         try:
@@ -964,9 +1234,33 @@ def main() -> None:
                         status_msg = result
                         status_expiry = time.time() + STATUS_MSG_TTL_SECS
                     live.update(render(status_msg))
+                # Voice (2026-10-15). Keyboard above this tick wins outright:
+                # a key the operator actually pressed beats anything the mic
+                # may still be thinking about. Session model: tui owns the
+                # arm/disarm decision, voice_io reopens capture per utterance
+                # while armed (keep_armed holds off until our own TTS is
+                # silent -- the echo gate has two layers now, this one stops
+                # RE-ARMING, voice_io's own gate stops CAPTURING).
+                if _voice is not None:
+                    if _voice_session:
+                        _voice.keep_armed()
+                    for cmd in _voice.drain_commands():
+                        try:
+                            result = _handle_voice_command(cmd)
+                        except Exception as exc:  # noqa: BLE001 -- identical
+                            # policy to the keypress catch-all above: a bad
+                            # transcript must never take the dashboard down.
+                            log.exception("tui.py: unhandled exception from voice command %r -- dashboard stays up.", cmd.text)
+                            result = f"Internal error handling that command (see log): {exc}"
+                        if result:
+                            status_msg = result
+                            status_expiry = time.time() + STATUS_MSG_TTL_SECS
+                            live.update(render(status_msg))
                 time.sleep(0.02)
         except KeyboardInterrupt:
             pass
+    if _voice is not None:
+        _voice.stop()
     console.print("[yellow]Terminal control dashboard stopped — bot/screener.py keeps running independently.[/yellow]")
 
 

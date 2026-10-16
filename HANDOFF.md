@@ -1,5 +1,16 @@
 # GMGN-bot — handoff (2026-09-06, fully autonomous rebuild)
 
+## Operator dashboard-reset instruction (2026-10-13)
+
+When the operator says "clear the dash" or asks to clear all trading data for
+a fresh run, stop the bot first and verify it is stopped. Archive the current
+paper/live portfolio and PnL state, dashboard trade history, screening/buy
+activity, AI judgment log, and trade-burst state before resetting them to
+empty defaults. Do not erase the master trade-history log or AI learning
+memory/lessons; preserve seen-mint and signal-source cursors to avoid
+reprocessing tokens and duplicate buys. Keep the configured trading mode
+unchanged.
+
 **Architecture changed completely from the 9/5 version of this file.** GMGN-bot
 is now fully autonomous, matching Axiom-bot's own model — no human approval
 gate. The instant a token clears `bot/security.py`'s screening, the bot buys

@@ -51,14 +51,8 @@ def check_trenches_fields(token: dict) -> SecurityResult:
     not skipped."""
     reasons: list[str] = []
 
-    # 2026-09-08: these five thresholds are now AI-tunable (see
-    # bot/ai_review.py's _AI_FIELD_BOUNDS) -- read via get_effective_*()
-    # rather than the raw config.* fields so a live adjustment actually
-    # changes what gets screened, same pattern the exit fields already use.
+    # Active adjustable screening thresholds use the paper-mode AI overrides.
     max_rug_ratio = ai_review.get_effective_max_rug_ratio()
-    max_top_10_holder_rate = ai_review.get_effective_max_top_10_holder_rate()
-    max_bundler_rate = ai_review.get_effective_max_bundler_rate()
-    max_rat_trader_rate = ai_review.get_effective_max_rat_trader_rate()
     min_liquidity_usd = ai_review.get_effective_min_liquidity_usd()
 
     rug_ratio = token.get("rug_ratio")
@@ -81,9 +75,8 @@ def check_trenches_fields(token: dict) -> SecurityResult:
     # (see config.py's liquidity_drain_mcap_threshold_usd/liquidity_drain_pct
     # docstring) watches the pool itself draining once a position has real
     # market cap behind it, rather than trying to infer risk from who's
-    # holding. get_effective_max_top_10_holder_rate()/_max_bundler_rate()/
-    # _max_rat_trader_rate() calls above and their AI-tunable bounds are
-    # left in place, unused, in case this ever needs reverting -- same
+    # holding. The three unused threshold fields remain in config for
+    # compatibility but are not adjustable or enforced -- same
     # precedent as min_holder_count's own removal 2026-09-06.
 
     liquidity = token.get("liquidity")
@@ -104,9 +97,7 @@ def check_trenches_fields(token: dict) -> SecurityResult:
     # "ray_launchpad" (verified via BASKET, consistent between the trenches
     # and get_token_info() endpoints) both report real liquidity and stay
     # fully tradeable. Hard-coded, NOT an AI-tunable field -- this is a
-    # categorical safety exclusion the user decided directly, same category
-    # as require_renounced_mint/require_renounced_freeze below, not a
-    # strategy dial to hand to the AI. "launchpad" confirmed present on
+    # categorical exclusion the user decided directly. "launchpad" confirmed present on
     # trenches' own cheap response (no extra API call needed) and spelled
     # identically ("meteora_virtual_curve") on both the trenches and
     # get_token_info() endpoints.
@@ -115,13 +106,15 @@ def check_trenches_fields(token: dict) -> SecurityResult:
 
     # Market cap trading band (2026-09-16) -- see config.py's own
     # min_market_cap_usd/max_market_cap_usd docstring for the full,
-    # real-data-backed reasoning. Hard-coded, not AI-tunable.
+    # real-data-backed reasoning. Both values are AI-tunable in paper mode.
+    min_market_cap_usd = ai_review.get_effective_value("min_market_cap_usd")
+    max_market_cap_usd = ai_review.get_effective_value("max_market_cap_usd")
     market_cap = token.get("market_cap")
     if market_cap is not None:
-        if config.min_market_cap_usd > 0 and market_cap < config.min_market_cap_usd:
-            reasons.append(f"market_cap ${market_cap:.0f} < ${config.min_market_cap_usd:.0f} min")
-        if config.max_market_cap_usd > 0 and market_cap > config.max_market_cap_usd:
-            reasons.append(f"market_cap ${market_cap:.0f} > ${config.max_market_cap_usd:.0f} max")
+        if min_market_cap_usd > 0 and market_cap < min_market_cap_usd:
+            reasons.append(f"market_cap ${market_cap:.0f} < ${min_market_cap_usd:.0f} min")
+        if max_market_cap_usd > 0 and market_cap > max_market_cap_usd:
+            reasons.append(f"market_cap ${market_cap:.0f} > ${max_market_cap_usd:.0f} max")
 
     # Liquidity-to-market-cap ratio (2026-09-17) -- see config.py's own
     # min_liquidity_to_mcap_ratio docstring for the full reasoning. Catches
@@ -133,8 +126,9 @@ def check_trenches_fields(token: dict) -> SecurityResult:
     # missing value on their own, no need to double-reject the same gap.
     if liquidity is not None and market_cap is not None and market_cap > 0:
         ratio = liquidity / market_cap
-        if config.min_liquidity_to_mcap_ratio > 0 and ratio < config.min_liquidity_to_mcap_ratio:
-            reasons.append(f"liq_to_mcap_ratio {ratio:.3f} < {config.min_liquidity_to_mcap_ratio:.3f} min")
+        min_liquidity_to_mcap_ratio = ai_review.get_effective_value("min_liquidity_to_mcap_ratio")
+        if min_liquidity_to_mcap_ratio > 0 and ratio < min_liquidity_to_mcap_ratio:
+            reasons.append(f"liq_to_mcap_ratio {ratio:.3f} < {min_liquidity_to_mcap_ratio:.3f} min")
 
     # Buy-pressure / momentum entry filter (2026-09-17) -- see config.py's
     # own min_net_buy_24h_usd/min_buys_24h docstring for the full real-data
@@ -164,15 +158,20 @@ def check_trenches_fields(token: dict) -> SecurityResult:
         net_buy_24h = token.get("net_buy_24h")
         if net_buy_24h is None:
             reasons.append("net_buy_24h missing")
-        elif net_buy_24h < config.min_net_buy_24h_usd:
-            reasons.append(f"net_buy_24h ${net_buy_24h:.0f} < ${config.min_net_buy_24h_usd:.0f} min")
+        else:
+            min_net_buy_24h_usd = ai_review.get_effective_value("min_net_buy_24h_usd")
+            if net_buy_24h < min_net_buy_24h_usd:
+                reasons.append(
+                    f"net_buy_24h ${net_buy_24h:.0f} < ${min_net_buy_24h_usd:.0f} min")
 
     if "buys_24h" in token:
         buys_24h = token.get("buys_24h")
         if buys_24h is None:
             reasons.append("buys_24h missing")
-        elif buys_24h < config.min_buys_24h:
-            reasons.append(f"buys_24h {buys_24h} < {config.min_buys_24h} min")
+        else:
+            min_buys_24h = ai_review.get_effective_value("min_buys_24h")
+            if buys_24h < min_buys_24h:
+                reasons.append(f"buys_24h {buys_24h} < {min_buys_24h} min")
 
     # holder_count check REMOVED (2026-09-06, user's explicit request: "it
     # doesn't matter how many holders there is I want him to trade with all
@@ -186,11 +185,11 @@ def check_trenches_fields(token: dict) -> SecurityResult:
 
     # renounced_mint/renounced_freeze_account come through as 0/1 ints from
     # trenches (confirmed live), not bool -- normalize before comparing.
-    if config.require_renounced_mint:
+    if ai_review.get_effective_value("require_renounced_mint"):
         renounced_mint = token.get("renounced_mint")
         if not renounced_mint:
             reasons.append("mint authority not renounced")
-    if config.require_renounced_freeze:
+    if ai_review.get_effective_value("require_renounced_freeze"):
         renounced_freeze = token.get("renounced_freeze_account")
         if not renounced_freeze:
             reasons.append("freeze authority not renounced")
@@ -328,10 +327,12 @@ async def check_arbitrary_token_candidate(address: str, chain: str) -> SecurityR
         except (TypeError, ValueError):
             market_cap = None
         if market_cap is not None:
-            if config.min_market_cap_usd > 0 and market_cap < config.min_market_cap_usd:
-                reasons.append(f"market_cap ${market_cap:.0f} < ${config.min_market_cap_usd:.0f} min")
-            if config.max_market_cap_usd > 0 and market_cap > config.max_market_cap_usd:
-                reasons.append(f"market_cap ${market_cap:.0f} > ${config.max_market_cap_usd:.0f} max")
+            min_market_cap_usd = ai_review.get_effective_value("min_market_cap_usd")
+            max_market_cap_usd = ai_review.get_effective_value("max_market_cap_usd")
+            if min_market_cap_usd > 0 and market_cap < min_market_cap_usd:
+                reasons.append(f"market_cap ${market_cap:.0f} < ${min_market_cap_usd:.0f} min")
+            if max_market_cap_usd > 0 and market_cap > max_market_cap_usd:
+                reasons.append(f"market_cap ${market_cap:.0f} > ${max_market_cap_usd:.0f} max")
 
     # Defensive float() conversion (2026-09-15, real case hit live): an
     # unrecognized/not-yet-indexed token can come back from get_token_info()
@@ -360,8 +361,9 @@ async def check_arbitrary_token_candidate(address: str, chain: str) -> SecurityR
     # signal source is held to the same boundary.
     if liquidity is not None and market_cap is not None and market_cap > 0:
         ratio = liquidity / market_cap
-        if config.min_liquidity_to_mcap_ratio > 0 and ratio < config.min_liquidity_to_mcap_ratio:
-            reasons.append(f"liq_to_mcap_ratio {ratio:.3f} < {config.min_liquidity_to_mcap_ratio:.3f} min")
+        min_liquidity_to_mcap_ratio = ai_review.get_effective_value("min_liquidity_to_mcap_ratio")
+        if min_liquidity_to_mcap_ratio > 0 and ratio < min_liquidity_to_mcap_ratio:
+            reasons.append(f"liq_to_mcap_ratio {ratio:.3f} < {min_liquidity_to_mcap_ratio:.3f} min")
 
     if isinstance(sec_result, gmgn.GmgnRateLimitError):
         await rate_limiter.handle_hit(sec_result.retry_after_secs)
@@ -383,9 +385,9 @@ async def check_arbitrary_token_candidate(address: str, chain: str) -> SecurityR
     # renounced_mint/renounced_freeze_account come back as real Python bool
     # here (confirmed live 2026-09-15) -- unlike trenches' 0/1 ints, but
     # `not renounced_mint` works correctly either way.
-    if config.require_renounced_mint and not sec.get("renounced_mint"):
+    if ai_review.get_effective_value("require_renounced_mint") and not sec.get("renounced_mint"):
         reasons.append("mint authority not renounced")
-    if config.require_renounced_freeze and not sec.get("renounced_freeze_account"):
+    if ai_review.get_effective_value("require_renounced_freeze") and not sec.get("renounced_freeze_account"):
         reasons.append("freeze authority not renounced")
 
     reasons.extend(check_token_security(sec).reasons)

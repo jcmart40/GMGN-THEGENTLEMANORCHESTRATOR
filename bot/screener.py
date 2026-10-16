@@ -1,15 +1,14 @@
-"""Core screening loop: continuously polls GMGN's trenches endpoint for
-newly-created tokens, runs both security-audit passes (bot/security.py),
+"""Core screening loop: polls GMGN's new and completed token trenches plus
+market trending, runs both security-audit passes (bot/security.py),
 and -- as of 2026-09-06, user's explicit direction to make this fully
 autonomous, matching Axiom-bot's own no-human-in-the-loop trading model --
 buys the INSTANT a candidate clears, no staging, no approval step. The
-security screen (bot/security.py) is the only gate on what gets bought;
-there is deliberately no entry-side risk limit (no daily loss cap, no
-position-count cap, no cooldown) per that same direction. Exit management
-(stop-loss/take-profit) lives in bot/exit_manager.py, run alongside this
-loop -- see run_forever() in main.py-equivalent role here, since GMGN-bot
-has no separate main.py (this loop IS the engine, same reasoning
-tui.py's own docstring gives for why it's the closest analog).
+security screen and trading-control checks (mode, pauses, trade frequency,
+and concurrent-position cap) gate every buy. Exit management lives in
+bot/exit_manager.py, run alongside this loop -- see run_forever() in the
+main.py-equivalent role here, since GMGN-bot has no separate main.py (this
+loop IS the engine, same reasoning tui.py's own docstring gives for why
+it's the closest analog).
 
 cleared_candidates.json is kept as a trade-history log (what got bought,
 when, at what mode/result) -- NOT a pending-approval queue anymore. The
@@ -202,11 +201,12 @@ async def _autonomous_buy(token: dict, trenches_result: security.SecurityResult,
     # since only one mode is active at a time.
     open_count = (len(paper_trader.get_portfolio()["positions"]) if mode == "paper"
                   else len(executor.get_positions()["positions"]))
-    if open_count >= config.max_concurrent_positions:
+    max_concurrent_positions = ai_review.get_effective_value("max_concurrent_positions")
+    if open_count >= max_concurrent_positions:
         entry["status"] = "skipped_max_positions"
         _append_trade_log(entry)
         log.info("CLEARED %s (%s) -- already at max_concurrent_positions (%d), not buying.",
-                  symbol, address, config.max_concurrent_positions)
+                  symbol, address, max_concurrent_positions)
         return
 
     if mode == "paper":
@@ -286,6 +286,7 @@ def _append_activity(token: dict, verdict: str, reasons: list[str] | None = None
         "ts": time.time(),
         "symbol": token.get("symbol"),
         "address": token.get("address"),
+        "source": token.get("source", "screening"),
         "verdict": verdict,  # "cleared" | "rejected"
         "reasons": reasons or [],
         # 2026-09-16: how long screening's own detection-to-decision pipeline
@@ -330,50 +331,60 @@ def _append_activity(token: dict, verdict: str, reasons: list[str] | None = None
 
 
 async def screen_once(seen: Set[str]) -> int:
-    """One screening pass: fetch trending candidates, run the fast
-    trenches-field check first (no extra API call), only call
-    get_token_security() (a real extra HTTP round-trip) for candidates
-    that already cleared the free first pass -- avoids spending API calls
-    auditing tokens that were always going to fail the cheap check anyway.
+    """Fetch launch, completed, and trending candidates, then screen each
+    once. Run the fast trenches-field check first (no extra API call); only
+    call get_token_security() (a real extra HTTP round-trip) for candidates
+    that already cleared the free first pass.
     Returns how many NEW (not-yet-seen) tokens were evaluated this pass.
 
-    SWITCHED from trenches (new_creation + completed) to `market trending`
-    (2026-09-19, user's explicit direction after watching live charts:
-    "stop him from buying from the trenches because that area is brutal...
-    98% of the tokens never make it. I mush rather buying from trending").
-    Trending tokens range roughly 1 minute to 1 day old (user's own
-    observation, confirmed against real data) -- already-proven survivors
-    with real holder/volume history, a fundamentally different risk profile
-    than a brand-new deploy. bot/security.py's check_trenches_fields() was
-    updated alongside this change -- net_buy_24h/buys_24h are trenches-only
-    fields, confirmed absent entirely from a real get_trending() response
-    (not null, not present -- same failure shape bundler_rate had 2026-09-06),
-    so that check is now key-presence-aware rather than fail-closed on a
-    field this endpoint never returns. Every other field the security
-    pipeline reads (rug_ratio, top_10_holder_rate, liquidity, market_cap,
-    is_wash_trading, renounced_mint/renounced_freeze_account) confirmed
-    present with the same names/types on trending's real response.
-    new_creation_max_age no longer applies (trending has no equivalent
-    filter) -- left defined in config.py, unused, same precedent as
-    min_holder_count."""
-    candidates: list = []
-    try:
-        candidates = await asyncio.to_thread(
-            gmgn.get_trending, chain=config.chain, interval="1h", limit=80)
-        rate_limiter.reset()
-    except gmgn.GmgnRateLimitError as exc:
-        log.warning("Trending poll hit GMGN's rate limit.")
-        await rate_limiter.handle_hit(exc.retry_after_secs)
-    except gmgn.GmgnCliError:
-        log.exception("Trending poll failed -- one bad poll must not kill this loop.")
+    New deployments are age-filtered independently from completed tokens:
+    GMGN applies --max-created request-wide, which would otherwise exclude
+    migrated tokens from the completed category.
+    """
+    sources = (
+        ("new_creation", lambda: gmgn.get_trenches(
+            chain=config.chain, types=["new_creation"], limit=80,
+            max_created=ai_review.get_effective_value("new_creation_max_age") or None)),
+        ("completed", lambda: gmgn.get_trenches(
+            chain=config.chain, types=["completed"], limit=80)),
+        ("screening", lambda: gmgn.get_trending(
+            chain=config.chain, interval="1h", limit=80)),
+    )
+    candidates: list[tuple[str, dict]] = []
+    for source, fetch in sources:
+        try:
+            result = await asyncio.to_thread(fetch)
+            rate_limiter.reset()
+        except gmgn.GmgnRateLimitError as exc:
+            log.warning("%s candidate poll hit GMGN's rate limit.", source)
+            await rate_limiter.handle_hit(exc.retry_after_secs)
+            continue
+        except gmgn.GmgnCliError:
+            log.exception("%s candidate poll failed -- continuing with other sources.", source)
+            continue
+
+        if source == "screening":
+            source_candidates = result
+        elif isinstance(result, dict):
+            if source not in result:
+                log.warning("GMGN %s response did not include its requested category.", source)
+                continue
+            source_candidates = result[source]
+        else:
+            source_candidates = None
+        if not isinstance(source_candidates, list):
+            log.warning("GMGN %s candidate response was not a list; skipping this source.", source)
+            continue
+        candidates.extend((source, token) for token in source_candidates if isinstance(token, dict))
 
     new_count = 0
-    for token in candidates:
+    for source, token in candidates:
         address = token.get("address")
         if not address or address in seen:
             continue
         seen.add(address)
         new_count += 1
+        token["source"] = source
 
         # Signal-to-buy latency instrumentation (2026-09-16, user + son's
         # explicit request, Axiom-bot's own trigger_ts pattern) -- stamped
@@ -418,7 +429,10 @@ async def screen_once(seen: Set[str]) -> int:
             continue
 
         _append_activity(token, "cleared")
-        await _autonomous_buy(token, trenches_result, security_result)
+        await _autonomous_buy(
+            token, trenches_result, security_result,
+            source="screening" if source == "screening" else source,
+        )
 
     return new_count
 
