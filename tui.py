@@ -1196,7 +1196,13 @@ def main() -> None:
         _voice.start()
     elif config.voice_enabled:
         log.warning("tui.py: VOICE_ENABLED=true but voice_io failed to import -- running voiceless.")
-    with Live(render(), console=console, screen=True, refresh_per_second=10) as live:
+    # Live incremental render, not screen=True (2026-10-16, flicker fix): the
+    # old screen=True did a full clear-and-redraw of the whole dashboard every
+    # REFRESH_SECS, which visibly flickered on Windows terminals. screen=False
+    # repaints only the changed cells in place and keeps the update snappy.
+    # refresh_per_second dropped 10 -> 5: a 0.5s clock never needs 10fps and
+    # the extra churn only worsened the flicker. Cosmetic, doesn't touch trades.
+    with Live(render(), console=console, screen=False, refresh_per_second=5) as live:
         last_refresh = 0.0
         try:
             while True:
