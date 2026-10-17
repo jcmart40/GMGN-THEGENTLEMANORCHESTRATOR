@@ -88,14 +88,14 @@ class Config:
         default_factory=lambda: _get_float("RATE_LIMIT_BACKOFF_BASE_SECS", 5.0))
     rate_limit_max_consecutive: int = field(
         default_factory=lambda: _get_int("RATE_LIMIT_MAX_CONSECUTIVE", 3))
-    # Default raised 45 -> 300 on 2026-10-17 after the 10/15 incident: GMGN's
-    # own 429 text states "repeated requests can extend the ban by 5s up to 5
-    # minutes", and with six concurrent loops hammering the same IP a 45s
-    # pause was far too short to actually wait out a hard ban. 300s = a full
-    # wait out of GMGN's worst-case window before sending another probe.
+    # Default lowered 300 -> 90 on 2026-10-16 (user's choice) for a livelier
+    # screen demo. GMGN's 429 text says a hard ban can last "up to 5 minutes"
+    # and that repeated requests EXTEND it -- 90s is a compromise: short
+    # enough to keep candidates flowing between ban windows, long enough to
+    # pause frequently instead of tight-looping (the 10/15 spin-loop failure).
     # Overridable in .env with RATE_LIMIT_COOLDOWN_SECS.
     rate_limit_cooldown_secs: float = field(
-        default_factory=lambda: _get_float("RATE_LIMIT_COOLDOWN_SECS", 300.0))
+        default_factory=lambda: _get_float("RATE_LIMIT_COOLDOWN_SECS", 90.0))
 
     # -- Security gate thresholds (fail-closed: missing/None data on any of
     # these is treated as a REJECT, never a silent pass -- same philosophy
