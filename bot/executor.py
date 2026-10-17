@@ -128,6 +128,18 @@ def _load_positions() -> dict:
     try:
         with open(config.live_positions_file, "r", encoding="utf-8") as f:
             data = json.load(f)
+        # Defensive: a leftover/corrupt file (e.g. a list, or a dict from an
+        # older schema) must never crash the loader -- treat anything that
+        # isn't a plain dict as "fresh state" instead. Fixes a live bug where
+        # logs/live_positions.json containing '[]' fired
+        # `AttributeError: 'list' object has no attribute 'setdefault'` on
+        # every load, which spammed the terminal (dashboard churn/flicker)
+        # and made the positions panel unable to refresh. Added 2026-10-17.
+        if not isinstance(data, dict):
+            log.warning("Live positions file had unexpected shape (got %s, expected dict) "
+                        "-- treating as fresh state rather than crashing the loader.",
+                        type(data).__name__)
+            return _default_state()
         data.setdefault("positions", {})
         data.setdefault("closed", [])
         return data
