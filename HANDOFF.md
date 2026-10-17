@@ -26,6 +26,27 @@ Fixes now committed (commit 568dcb3, pushed):
 Restart the bot with `restart_all.bat` (or manually: `python -m bot.screener`
 + one `python tui.py`).
 
+## 2026-10-17 — Fresh dashboard reset switch (backup + clear + optional push)
+
+New `dashboard_reset.bat` (double-click, or the pinned "Gentleman Fresh Reset"
+taskbar item). Runs `dashboard_reset.ps1`:
+
+- Always backs up ALL logs to `logs/backups/<label>_<timestamp>/` FIRST, so
+  nothing is ever lost before anything is cleared.
+- Option 1: save logs only (no clearing).
+- Option 2: standard fresh start — archives + empties activity log, cleared
+  candidates, dash-bound trade history, AI-judgment log, trade-burst state.
+- Option 3: full fresh start — additionally archives + empties open paper/live
+  positions (with a confirm prompt).
+- NEVER erases learning memory (ai_memory), AI Free Will overrides, open
+  positions (option 2), seen-mint cursors, master trade history, gentleman
+  chat. Those are preserved by design.
+- OPTIONAL push: stores the snapshot on a dedicated GitHub branch `logs-backup`
+  (never `main`) so there is a recovery copy even if credits run out and the
+  assistant can't be reached. Recover later from that branch.
+- Safe test sequencing: backups written before any clear; kill_gmgn.ps1 pauses
+  the bot so files aren't written mid-reset.
+
 ## 2026-10-15 — TOMORROW: The Gentleman is STUCK (rate-limit spin loop) + flicker
 
 **State: the bot process is effectively hung and needs a clean restart before
