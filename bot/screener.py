@@ -378,6 +378,20 @@ async def screen_once(seen: Set[str]) -> int:
         candidates.extend((source, token) for token in source_candidates if isinstance(token, dict))
 
     new_count = 0
+
+    # Short-circuit the whole pass on an active rate limit (2026-10-17). If
+    # any source poll above hit a ban (or another shared loop, e.g.
+    # exit_manager, set the shared throttle), every candidate in this pass
+    # would fail its security check with "rate-limited (fail-closed)" and
+    # each would spawn a gmgn-cli call -- up to ~240 subprocesses that, during
+    # a hard ban, spin ~15s in a broken libuv state before the timeout kills
+    # them. That per-candidate hammering is exactly what extended the 10/15
+    # ban and burned ~943s of CPU. Instead, skip to the next poll cycle.
+    if rate_limiter.throttled():
+        log.warning("Rate limit still in force -- skipping the %d-candidate screening "
+                    "pass this cycle (short-circuit).", len(candidates))
+        return new_count
+
     for source, token in candidates:
         address = token.get("address")
         if not address or address in seen:

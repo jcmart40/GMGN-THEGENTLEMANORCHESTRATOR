@@ -414,6 +414,14 @@ async def _check_positions_batched(positions: dict, apply_fn) -> None:
 
 
 async def check_exits_once() -> None:
+    # Short-circuit the whole exit pass while a shared rate-limit cooldown is
+    # in force (2026-10-17, same logic as the screener's pass short-circuit):
+    # position price-fetches hit the SAME banned IP, so every batch would
+    # take the full gmgn-cli timeout and extend the ban. Skip to the next
+    # cycle instead of hammering.
+    if rate_limiter.throttled():
+        log.warning("Exit check: rate limit still in force -- skipping this exit pass (short-circuit).")
+        return
     paper_positions = dict(paper_trader.get_portfolio().get("positions", {}))
     await _check_positions_batched(paper_positions, _apply_paper_exit)
 
