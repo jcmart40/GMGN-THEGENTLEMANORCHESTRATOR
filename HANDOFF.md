@@ -1,5 +1,31 @@
 # GMGN-bot — handoff (2026-09-06, fully autonomous rebuild)
 
+## 2026-10-17 — Rate-limit hardening applied (+ clean restart helper)
+
+Root cause of the 10/15 incident (confirmed from logs, not just theory):
+GMGN hard-banned the IP ("up to 5 minutes"), but the 45s cooldown was far
+too short and SIX concurrent loops (`_screen_loop`, exit_manager,
+_ai_review_loop, dev_snipe, token_snipe, ai_judgment) kept hammering the
+same banned IP. The Python backoff WAS sleeping correctly; the ~943s CPU /
+45-min hang came from each gmgn-cli call spinning ~15s in a broken libuv
+state (`Assertion failed: src\win\async.c, line 94`) before the 15s timeout
+killed it, repeated across up to ~240 candidates per screening pass.
+
+Fixes now committed (commit 568dcb3, pushed):
+- `RATE_LIMIT_COOLDOWN_SECS` default 45 -> 300 (GMGN worst-case ban window).
+- `rate_limiter.handle_hit()` waits >= full cooldown even when GMGN reports a
+  shorter reset, and now publishes a shared `throttled()` state.
+- `bot/screener.py` `screen_once()` short-circuits the whole pass while
+  throttled (no more ~240 per-candidate fail-closed gmgn-cli spawns).
+- `bot/exit_manager.py` short-circuits its pass while throttled too.
+- New `restart_all.bat` (double-click) runs `kill_gmgn.ps1` to kill ALL stuck
+  screener/dashboard process trees, then starts ONE `python -m bot.screener`
+  + ONE `python tui.py`. Use this instead of hunting PIDs. Don't run two
+  tui.py windows (parent forks a child -> flicker returns).
+
+Restart the bot with `restart_all.bat` (or manually: `python -m bot.screener`
++ one `python tui.py`).
+
 ## 2026-10-15 — TOMORROW: The Gentleman is STUCK (rate-limit spin loop) + flicker
 
 **State: the bot process is effectively hung and needs a clean restart before
